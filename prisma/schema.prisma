@@ -1,0 +1,402 @@
+// LabVault — Lab Management System
+// Multi-tenant schema (every domain table is scoped by organizationId)
+// NOTE: SQLite provider does not support enums — status/role fields are Strings
+// validated against constants in src/lib/constants.ts
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  plan      String   @default("PRO") // FREE | PRO | ENTERPRISE
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users            User[]
+  labs             Lab[]
+  equipment        Equipment[]
+  reservations     Reservation[]
+  checkouts        Checkout[]
+  inventoryItems   InventoryItem[]
+  chemicals        Chemical[]
+  maintenance      MaintenanceRecord[]
+  experiments      Experiment[]
+  sessions         LabSession[]
+  attendance       Attendance[]
+  incidents        Incident[]
+  vendors          Vendor[]
+  purchaseRequests PurchaseRequest[]
+  auditLogs        AuditLog[]
+  notifications    Notification[]
+
+  @@map("organizations")
+}
+
+model User {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  email          String   @unique
+  passwordHash   String
+  role           String   @default("STUDENT") // ADMIN | LAB_MANAGER | INSTRUCTOR | TECHNICIAN | STUDENT
+  status         String   @default("ACTIVE") // ACTIVE | SUSPENDED
+  phone          String?
+  department     String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  managedLabs        Lab[]               @relation("LabManager")
+  reservations       Reservation[]
+  checkouts          Checkout[]
+  reportedIncidents  Incident[]          @relation("IncidentReporter")
+  experiments        Experiment[]        @relation("ExperimentInstructor")
+  instructedSessions LabSession[]        @relation("SessionInstructor")
+  attendance         Attendance[]
+  maintenanceJobs    MaintenanceRecord[] @relation("Technician")
+  purchaseRequests   PurchaseRequest[]   @relation("RequestedBy")
+  auditLogs          AuditLog[]
+  notifications      Notification[]
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+model Lab {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  code           String
+  location       String?
+  capacity       Int      @default(0)
+  status         String   @default("ACTIVE") // ACTIVE | MAINTENANCE | CLOSED
+  description    String?
+  managerId      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  manager        User?           @relation("LabManager", fields: [managerId], references: [id])
+  equipment      Equipment[]
+  inventoryItems InventoryItem[]
+  chemicals      Chemical[]
+  experiments    Experiment[]
+  incidents      Incident[]
+  sessions       LabSession[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("labs")
+}
+
+model Equipment {
+  id             String    @id @default(cuid())
+  organizationId String
+  labId          String
+  name           String
+  code           String
+  category       String    @default("GENERAL") // GENERAL | INSTRUMENT | COMPUTING | SAFETY | OPTICS | ELECTRICAL
+  status         String    @default("AVAILABLE") // AVAILABLE | IN_USE | UNDER_MAINTENANCE | RETIRED
+  condition      String    @default("GOOD") // EXCELLENT | GOOD | FAIR | POOR
+  serialNumber   String?
+  manufacturer   String?
+  purchaseDate   DateTime?
+  price          Float     @default(0)
+  qrToken        String    @unique @default(cuid())
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lab                Lab                 @relation(fields: [labId], references: [id])
+  reservations       Reservation[]
+  checkouts          Checkout[]
+  maintenanceRecords MaintenanceRecord[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([labId])
+  @@map("equipment")
+}
+
+model Reservation {
+  id             String   @id @default(cuid())
+  organizationId String
+  equipmentId    String
+  userId         String
+  startAt        DateTime
+  endAt          DateTime
+  status         String   @default("PENDING") // PENDING | APPROVED | REJECTED | CANCELLED | COMPLETED
+  purpose        String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  equipment    Equipment    @relation(fields: [equipmentId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@index([equipmentId])
+  @@map("reservations")
+}
+
+model Checkout {
+  id             String    @id @default(cuid())
+  organizationId String
+  equipmentId    String
+  userId         String
+  checkedOutAt   DateTime  @default(now())
+  dueAt          DateTime
+  checkedInAt    DateTime?
+  status         String    @default("ACTIVE") // ACTIVE | RETURNED | OVERDUE
+  conditionOut   String?
+  conditionIn    String?
+  notes          String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  equipment    Equipment    @relation(fields: [equipmentId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@index([equipmentId])
+  @@map("checkouts")
+}
+
+model InventoryItem {
+  id             String   @id @default(cuid())
+  organizationId String
+  labId          String
+  name           String
+  sku            String
+  category       String   @default("CONSUMABLE") // CONSUMABLE | SPARE | STATIONERY | SAFETY
+  quantity       Int      @default(0)
+  unit           String   @default("pcs")
+  minQuantity    Int      @default(5)
+  location       String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lab          Lab          @relation(fields: [labId], references: [id])
+
+  @@unique([organizationId, sku])
+  @@index([organizationId])
+  @@index([labId])
+  @@map("inventory_items")
+}
+
+model Chemical {
+  id              String    @id @default(cuid())
+  organizationId  String
+  labId           String
+  name            String
+  casNumber       String?
+  quantity        Float     @default(0)
+  unit            String    @default("mL")
+  hazardClass     String    @default("LOW") // LOW | FLAMMABLE | CORROSIVE | TOXIC | REACTIVE
+  expiryDate      DateTime?
+  storageLocation String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lab          Lab          @relation(fields: [labId], references: [id])
+
+  @@index([organizationId])
+  @@index([labId])
+  @@map("chemicals")
+}
+
+model MaintenanceRecord {
+  id             String    @id @default(cuid())
+  organizationId String
+  equipmentId    String
+  technicianId   String?
+  type           String    @default("PREVENTIVE") // PREVENTIVE | CORRECTIVE | CALIBRATION
+  status         String    @default("SCHEDULED") // SCHEDULED | IN_PROGRESS | COMPLETED | CANCELLED
+  scheduledAt    DateTime
+  completedAt    DateTime?
+  cost           Float     @default(0)
+  notes          String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  equipment    Equipment    @relation(fields: [equipmentId], references: [id])
+  technician   User?        @relation("Technician", fields: [technicianId], references: [id])
+
+  @@index([organizationId])
+  @@index([equipmentId])
+  @@map("maintenance_records")
+}
+
+model Experiment {
+  id             String   @id @default(cuid())
+  organizationId String
+  labId          String
+  instructorId   String?
+  title          String
+  code           String
+  description    String?
+  status         String   @default("ACTIVE") // DRAFT | ACTIVE | ARCHIVED
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lab          Lab          @relation(fields: [labId], references: [id])
+  instructor   User?        @relation("ExperimentInstructor", fields: [instructorId], references: [id])
+  sessions     LabSession[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("experiments")
+}
+
+model LabSession {
+  id             String   @id @default(cuid())
+  organizationId String
+  experimentId   String
+  labId          String?
+  instructorId   String?
+  title          String
+  scheduledAt    DateTime
+  durationMin    Int      @default(90)
+  status         String   @default("SCHEDULED") // SCHEDULED | IN_PROGRESS | COMPLETED | CANCELLED
+  room           String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  experiment   Experiment   @relation(fields: [experimentId], references: [id])
+  lab          Lab?         @relation(fields: [labId], references: [id])
+  instructor   User?        @relation("SessionInstructor", fields: [instructorId], references: [id])
+  attendance   Attendance[]
+
+  @@index([organizationId])
+  @@index([experimentId])
+  @@map("lab_sessions")
+}
+
+model Attendance {
+  id             String   @id @default(cuid())
+  organizationId String
+  sessionId      String
+  userId         String?
+  studentName    String
+  status         String   @default("PRESENT") // PRESENT | ABSENT | LATE
+  markedAt       DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  session      LabSession   @relation(fields: [sessionId], references: [id])
+  user         User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@index([sessionId])
+  @@map("attendance")
+}
+
+model Incident {
+  id             String   @id @default(cuid())
+  organizationId String
+  labId          String
+  reportedById   String?
+  title          String
+  description    String?
+  severity       String   @default("MEDIUM") // LOW | MEDIUM | HIGH | CRITICAL
+  status         String   @default("OPEN") // OPEN | INVESTIGATING | RESOLVED
+  occurredAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lab          Lab          @relation(fields: [labId], references: [id])
+  reportedBy   User?        @relation("IncidentReporter", fields: [reportedById], references: [id])
+
+  @@index([organizationId])
+  @@index([labId])
+  @@map("incidents")
+}
+
+model Vendor {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  contactEmail   String?
+  phone          String?
+  address        String?
+  category       String   @default("EQUIPMENT") // EQUIPMENT | CHEMICALS | CONSUMABLES | SERVICES
+  rating         Float    @default(4.0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  purchaseRequests PurchaseRequest[]
+
+  @@index([organizationId])
+  @@map("vendors")
+}
+
+model PurchaseRequest {
+  id             String   @id @default(cuid())
+  organizationId String
+  vendorId       String?
+  requestedById  String?
+  itemName       String
+  quantity       Int      @default(1)
+  estimatedCost  Float    @default(0)
+  status         String   @default("SUBMITTED") // DRAFT | SUBMITTED | APPROVED | REJECTED | ORDERED | RECEIVED
+  justification  String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  vendor       Vendor?      @relation(fields: [vendorId], references: [id])
+  requestedBy  User?        @relation("RequestedBy", fields: [requestedById], references: [id])
+
+  @@index([organizationId])
+  @@map("purchase_requests")
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  action         String
+  entityType     String
+  entityId       String?
+  metadata       String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  title          String
+  body           String?
+  type           String   @default("INFO") // INFO | WARNING | SUCCESS | ERROR
+  read           Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@index([userId])
+  @@map("notifications")
+}

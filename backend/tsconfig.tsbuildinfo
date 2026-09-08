@@ -1,1 +1,0 @@
-{"root":["./src/app.ts","./src/db.ts","./src/index.ts","./src/server.ts","./src/models/device.ts","./src/models/user.ts","./src/routes/api.ts","./src/routes/auth.ts","./src/routes/user.ts"],"errors":true,"version":"5.8.3"}
