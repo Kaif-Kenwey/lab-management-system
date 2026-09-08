@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,7 +10,6 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, FlaskConical } from "lucide-react";
 
 export default function RegisterPage() {
-  const router = useRouter();
   const [form, setForm] = useState({ orgName: "", name: "", email: "", password: "" });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -36,8 +34,9 @@ export default function RegisterPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Registration failed");
-      router.push("/dashboard");
-      router.refresh();
+      sessionStorage.setItem("lms_login_bounce", "1");
+      window.location.assign("/dashboard");
+      await new Promise(() => {});
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {

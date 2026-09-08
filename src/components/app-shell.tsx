@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { Topbar } from "@/components/topbar";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -13,6 +14,12 @@ export function AppShell({
   session: { name: string; email: string; role: string };
   orgName: string;
 }) {
+  // Reached the authenticated shell — the session cookie works, so clear any
+  // pending login-bounce flag used by the login page's cookie-block detector.
+  useEffect(() => {
+    sessionStorage.removeItem("lms_login_bounce");
+  }, []);
+
   return (
     <SidebarProvider>
       <AppSidebar role={session.role} orgName={orgName} />

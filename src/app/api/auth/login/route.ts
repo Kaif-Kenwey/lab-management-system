@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
 import { ok, fail, body } from "@/lib/api";
 import { verifyPassword, signSession, TOKEN_COOKIE } from "@/lib/auth";
+import { sessionCookieOptions } from "@/lib/cookies";
 
 export async function POST(req: NextRequest) {
   const { email, password } = await body<{ email?: string; password?: string }>(req);
@@ -29,11 +30,6 @@ export async function POST(req: NextRequest) {
   const res = ok({
     user: { id: user.id, name: user.name, email: user.email, role: user.role, orgName: user.organization.name },
   });
-  res.cookies.set(TOKEN_COOKIE, token, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 60 * 60 * 24 * 7,
-  });
+  res.cookies.set(TOKEN_COOKIE, token, sessionCookieOptions(req, 60 * 60 * 24 * 7));
   return res;
 }

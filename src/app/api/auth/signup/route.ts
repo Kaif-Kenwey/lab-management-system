@@ -1,7 +1,8 @@
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
-import { ok, fail, body, audit } from "@/lib/api";
+import { ok, fail, body } from "@/lib/api";
 import { hashPassword, signSession, TOKEN_COOKIE } from "@/lib/auth";
+import { sessionCookieOptions } from "@/lib/cookies";
 
 export async function POST(req: NextRequest) {
   const { orgName, name, email, password } = await body<{
@@ -73,11 +74,6 @@ export async function POST(req: NextRequest) {
     { user: { id: user.id, name: user.name, email: user.email, role: user.role, orgName: user.organization.name } },
     201
   );
-  res.cookies.set(TOKEN_COOKIE, token, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 60 * 60 * 24 * 7,
-  });
+  res.cookies.set(TOKEN_COOKIE, token, sessionCookieOptions(req, 60 * 60 * 24 * 7));
   return res;
 }
