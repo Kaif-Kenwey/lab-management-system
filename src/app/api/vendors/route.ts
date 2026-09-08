@@ -1,60 +1,54 @@
 import { NextRequest } from "next/server";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody } from "@/lib/validation";
+import { VENDOR_CATEGORY } from "@/lib/constants";
+
+export const createVendorSchema = z.object({
+  name: z.string().trim().min(1, "Vendor name is required").max(200),
+  contactEmail: z.string().trim().email("A valid contact email is required").nullish(),
+  phone: z.string().trim().max(40).nullish(),
+  address: z.string().trim().max(300).nullish(),
+  category: z.enum(VENDOR_CATEGORY).optional().default("EQUIPMENT"),
+  rating: z.coerce.number().min(0, "Rating must be between 0 and 5").max(5, "Rating must be between 0 and 5").optional().default(4.0),
+});
 
 export async function GET(req: NextRequest) {
-  return withAuth(async (session) => {
-    const q = req.nextUrl.searchParams.get("q")?.trim() ?? "";
-
+  return withAuth(req, async (ctx) => {
+    const q = ctx.searchParams.get("q")?.trim() ?? "";
     const vendors = await db.vendor.findMany({
       where: {
-        organizationId: session.orgId,
+        organizationId: ctx.session.orgId,
         ...(q
           ? { OR: [{ name: { contains: q } }, { contactEmail: { contains: q } }, { category: { contains: q } }] }
           : {}),
       },
+      include: { _count: { select: { purchaseRequests: true, purchaseOrders: true } } },
       orderBy: { name: "asc" },
     });
     return ok(vendors);
-  });
+  }, "procurement.read");
 }
 
 export async function POST(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{
-      name?: string;
-      contactEmail?: string;
-      phone?: string;
-      address?: string;
-      category?: string;
-      rating?: number | string;
-    }>(req);
-
-    if (!b.name?.trim()) return fail("Vendor name is required");
-
-    let rating = 4.0;
-    if (b.rating !== undefined && b.rating !== null && b.rating !== "") {
-      rating = Number(b.rating);
-      if (Number.isNaN(rating) || rating < 0 || rating > 5) {
-        return fail("Rating must be a number between 0 and 5");
-      }
-    }
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, createVendorSchema);
 
     const vendor = await db.vendor.create({
       data: {
-        organizationId: session.orgId,
-        name: b.name.trim(),
-        contactEmail: b.contactEmail ?? null,
-        phone: b.phone ?? null,
-        address: b.address ?? null,
-        category: b.category ?? "EQUIPMENT",
-        rating,
+        organizationId: ctx.session.orgId,
+        name: data.name,
+        contactEmail: data.contactEmail ?? null,
+        phone: data.phone ?? null,
+        address: data.address ?? null,
+        category: data.category,
+        rating: data.rating,
       },
     });
-    await audit(session.orgId, session.userId, "VENDOR_CREATED", "Vendor", vendor.id, {
+    await audit(ctx.session.orgId, ctx.session.userId, "VENDOR_CREATED", "Vendor", vendor.id, {
       name: vendor.name,
     });
     return ok(vendor, 201);
-  }, ["ADMIN", "LAB_MANAGER"]);
+  }, "procurement.approve");
 }

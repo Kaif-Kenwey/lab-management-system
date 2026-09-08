@@ -1,74 +1,84 @@
 import { NextRequest } from "next/server";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { NotFoundError, ValidationError } from "@/lib/errors";
+import { parseBody, dateString, mapPrismaError } from "@/lib/validation";
+
+const HAZARD = ["LOW", "FLAMMABLE", "CORROSIVE", "TOXIC", "REACTIVE"] as const;
+
+const patchSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  labId: z.string().min(1).optional(),
+  casNumber: z.string().trim().max(50).nullable().optional(),
+  batchNumber: z.string().trim().max(100).nullable().optional(),
+  supplier: z.string().trim().max(200).nullable().optional(),
+  quantity: z.coerce.number().min(0, "Quantity must be non-negative").optional(),
+  unit: z.string().trim().max(20).optional(),
+  hazardClass: z.enum(HAZARD).optional(),
+  expiryDate: dateString.nullable().optional(),
+  storageLocation: z.string().trim().max(200).nullable().optional(),
+});
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{
-      name?: string;
-      labId?: string;
-      casNumber?: string | null;
-      quantity?: number | string;
-      unit?: string;
-      hazardClass?: string;
-      expiryDate?: string | null;
-      storageLocation?: string | null;
-    }>(req);
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, patchSchema);
 
-    const chemical = await db.chemical.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!chemical) return fail("Chemical not found", 404);
-
-    if (b.labId) {
-      const lab = await db.lab.findFirst({ where: { id: b.labId, organizationId: session.orgId } });
-      if (!lab) return fail("Lab not found in your organization", 404);
-    }
-
-    const data: Prisma.ChemicalUncheckedUpdateInput = {};
-    if (b.name !== undefined) data.name = b.name.trim();
-    if (b.labId !== undefined) data.labId = b.labId;
-    if (b.casNumber !== undefined) data.casNumber = b.casNumber;
-    if (b.quantity !== undefined) {
-      const quantity = Number(b.quantity);
-      if (Number.isNaN(quantity) || quantity < 0) return fail("Quantity must be a non-negative number");
-      data.quantity = quantity;
-    }
-    if (b.unit !== undefined) data.unit = b.unit;
-    if (b.hazardClass !== undefined) data.hazardClass = b.hazardClass;
-    if (b.expiryDate !== undefined) {
-      if (b.expiryDate === null) {
-        data.expiryDate = null;
-      } else {
-        const d = new Date(b.expiryDate);
-        if (Number.isNaN(d.getTime())) return fail("Invalid expiryDate", 400);
-        data.expiryDate = d;
-      }
-    }
-    if (b.storageLocation !== undefined) data.storageLocation = b.storageLocation;
-
-    const updated = await db.chemical.update({
-      where: { id },
-      data,
-      include: { lab: { select: { id: true, name: true, code: true } } },
+    const chemical = await db.chemical.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
     });
-    await audit(session.orgId, session.userId, "CHEMICAL_UPDATED", "Chemical", id, {
-      name: updated.name,
-    });
-    return ok(updated);
-  });
+    if (!chemical) throw NotFoundError("Chemical not found");
+
+    if (data.labId) {
+      const lab = await db.lab.findFirst({
+        where: { id: data.labId, organizationId: ctx.session.orgId },
+      });
+      if (!lab) throw NotFoundError("Lab not found in your organization");
+    }
+
+    try {
+      const updated = await db.chemical.update({
+        where: { id: chemical.id },
+        data: {
+          ...(data.name !== undefined ? { name: data.name } : {}),
+          ...(data.labId !== undefined ? { labId: data.labId } : {}),
+          ...(data.casNumber !== undefined ? { casNumber: data.casNumber } : {}),
+          ...(data.batchNumber !== undefined ? { batchNumber: data.batchNumber } : {}),
+          ...(data.supplier !== undefined ? { supplier: data.supplier } : {}),
+          ...(data.quantity !== undefined ? { quantity: data.quantity } : {}),
+          ...(data.unit !== undefined ? { unit: data.unit } : {}),
+          ...(data.hazardClass !== undefined ? { hazardClass: data.hazardClass } : {}),
+          ...(data.expiryDate !== undefined ? { expiryDate: data.expiryDate } : {}),
+          ...(data.storageLocation !== undefined ? { storageLocation: data.storageLocation } : {}),
+        },
+        include: { lab: { select: { id: true, name: true, code: true } } },
+      });
+      await audit(ctx.session.orgId, ctx.session.userId, "CHEMICAL_UPDATED", "Chemical", id, {
+        name: updated.name,
+      });
+      return ok(updated);
+    } catch (e) {
+      mapPrismaError(e, "Chemical update failed");
+      throw e;
+    }
+  }, "chemicals.manage");
 }
 
-export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const chemical = await db.chemical.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!chemical) return fail("Chemical not found", 404);
+  return withAuth(req, async (ctx) => {
+    const chemical = await db.chemical.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
+    });
+    if (!chemical) throw NotFoundError("Chemical not found");
 
-    await db.chemical.delete({ where: { id } });
-    await audit(session.orgId, session.userId, "CHEMICAL_DELETED", "Chemical", id, {
+    await db.chemical.delete({ where: { id: chemical.id } });
+    await audit(ctx.session.orgId, ctx.session.userId, "CHEMICAL_DELETED", "Chemical", id, {
       name: chemical.name,
     });
     return ok({ success: true });
-  });
+  }, "chemicals.manage");
 }
+
+export const __internal = { ValidationError };

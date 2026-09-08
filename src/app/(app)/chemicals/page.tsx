@@ -43,7 +43,7 @@ async function fetcher(url: string) {
   const res = await fetch(url);
   if (!res.ok) {
     const d = await res.json().catch(() => ({}));
-    throw new Error(d.error || "Request failed");
+    throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Request failed");
   }
   return res.json();
 }
@@ -104,7 +104,7 @@ function ChemicalsContent() {
         body: JSON.stringify(payload),
       }).then(async (res) => {
         const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.error || "Create failed");
+        if (!res.ok) throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Create failed");
         return d;
       }),
     onSuccess: () => {

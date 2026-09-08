@@ -1,96 +1,92 @@
 import { NextRequest } from "next/server";
+import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody, optionalId } from "@/lib/validation";
+import { NotFoundError } from "@/lib/errors";
+
+const sessionInclude = {
+  experiment: { select: { id: true, title: true, code: true } },
+  lab: { select: { id: true, name: true } },
+  instructor: { select: { id: true, name: true, email: true } },
+  attendance: { orderBy: { markedAt: "asc" as const } },
+  grades: { orderBy: { createdAt: "asc" as const } },
+} satisfies Prisma.LabSessionInclude;
+
+export const createSessionSchema = z.object({
+  experimentId: z.string().min(1, "Experiment is required"),
+  title: z.string().trim().max(200).optional(),
+  scheduledAt: z.string().refine((v) => !Number.isNaN(new Date(v).getTime()), "Invalid scheduledAt date"),
+  durationMin: z.coerce.number().int().positive("durationMin must be a positive number").optional().default(90),
+  room: z.string().trim().max(120).nullish(),
+  labId: optionalId,
+  instructorId: optionalId,
+});
 
 export async function GET(req: NextRequest) {
-  return withAuth(async (session) => {
-    const sp = req.nextUrl.searchParams;
-    const status = sp.get("status")?.trim() ?? "";
-    const experimentId = sp.get("experimentId")?.trim() ?? "";
-
-    const where: Prisma.LabSessionWhereInput = {
-      organizationId: session.orgId,
-      ...(status ? { status } : {}),
-      ...(experimentId ? { experimentId } : {}),
-    };
+  return withAuth(req, async (ctx) => {
+    const experimentId = ctx.searchParams.get("experimentId")?.trim() ?? "";
+    const status = ctx.searchParams.get("status")?.trim() ?? "";
+    const labId = ctx.searchParams.get("labId")?.trim() ?? "";
+    const q = ctx.searchParams.get("q")?.trim() ?? "";
 
     const sessions = await db.labSession.findMany({
-      where,
-      include: {
-        experiment: { select: { id: true, title: true, code: true } },
-        lab: { select: { id: true, name: true } },
-        instructor: { select: { id: true, name: true } },
-        attendance: { orderBy: { markedAt: "asc" } },
+      where: {
+        organizationId: ctx.session.orgId,
+        ...(experimentId ? { experimentId } : {}),
+        ...(status ? { status } : {}),
+        ...(labId ? { labId } : {}),
+        ...(q ? { OR: [{ title: { contains: q } }, { room: { contains: q } }] } : {}),
       },
+      include: sessionInclude,
       orderBy: { scheduledAt: "desc" },
     });
     return ok(sessions);
-  });
+  }, "academics.read");
 }
 
 export async function POST(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{
-      experimentId?: string;
-      title?: string;
-      scheduledAt?: string;
-      durationMin?: number | string;
-      room?: string;
-      labId?: string;
-      instructorId?: string;
-    }>(req);
-
-    if (!b.experimentId || !b.scheduledAt) return fail("Experiment and scheduledAt are required");
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, createSessionSchema);
 
     const experiment = await db.experiment.findFirst({
-      where: { id: b.experimentId, organizationId: session.orgId },
+      where: { id: data.experimentId, organizationId: ctx.session.orgId },
     });
-    if (!experiment) return fail("Experiment not found in your organization", 404);
+    if (!experiment) throw NotFoundError("Experiment not found in your organization");
 
-    const scheduledAt = new Date(b.scheduledAt);
-    if (Number.isNaN(scheduledAt.getTime())) return fail("Invalid scheduledAt date", 400);
-
-    if (b.labId) {
-      const lab = await db.lab.findFirst({ where: { id: b.labId, organizationId: session.orgId } });
-      if (!lab) return fail("Lab not found in your organization", 404);
-    }
-    if (b.instructorId) {
-      const instructor = await db.user.findFirst({
-        where: { id: b.instructorId, organizationId: session.orgId },
+    if (data.labId) {
+      const lab = await db.lab.findFirst({
+        where: { id: data.labId, organizationId: ctx.session.orgId },
+        select: { id: true },
       });
-      if (!instructor) return fail("Instructor not found in your organization", 404);
+      if (!lab) throw NotFoundError("Lab not found in your organization");
     }
-
-    let durationMin = 90;
-    if (b.durationMin !== undefined && b.durationMin !== null && b.durationMin !== "") {
-      durationMin = Number(b.durationMin);
-      if (Number.isNaN(durationMin) || durationMin <= 0) return fail("durationMin must be a positive number");
-      durationMin = Math.trunc(durationMin);
+    if (data.instructorId) {
+      const instructor = await db.user.findFirst({
+        where: { id: data.instructorId, organizationId: ctx.session.orgId },
+        select: { id: true },
+      });
+      if (!instructor) throw NotFoundError("Instructor not found in your organization");
     }
 
     const labSession = await db.labSession.create({
       data: {
-        organizationId: session.orgId,
-        experimentId: b.experimentId,
-        title: b.title?.trim() ?? experiment.title,
-        scheduledAt,
-        durationMin,
-        room: b.room ?? null,
-        labId: b.labId ?? experiment.labId,
-        instructorId: b.instructorId ?? experiment.instructorId,
+        organizationId: ctx.session.orgId,
+        experimentId: data.experimentId,
+        title: data.title ?? experiment.title,
+        scheduledAt: new Date(data.scheduledAt),
+        durationMin: data.durationMin,
+        room: data.room ?? null,
+        labId: data.labId ?? experiment.labId,
+        instructorId: data.instructorId ?? experiment.instructorId,
       },
-      include: {
-        experiment: { select: { id: true, title: true, code: true } },
-        lab: { select: { id: true, name: true } },
-        instructor: { select: { id: true, name: true } },
-        attendance: { orderBy: { markedAt: "asc" } },
-      },
+      include: sessionInclude,
     });
-    await audit(session.orgId, session.userId, "SESSION_CREATED", "LabSession", labSession.id, {
+    await audit(ctx.session.orgId, ctx.session.userId, "SESSION_CREATED", "LabSession", labSession.id, {
       title: labSession.title,
       experiment: experiment.title,
     });
     return ok(labSession, 201);
-  });
+  }, "academics.manage");
 }

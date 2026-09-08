@@ -1,89 +1,115 @@
 import { NextRequest } from "next/server";
 import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { NotFoundError, ValidationError, ConflictError } from "@/lib/errors";
+import { parseBody, dateString } from "@/lib/validation";
+import { recordEquipmentEvent } from "@/lib/lifecycle";
+import { assertCanReserve, findOverlap, ACTIVE_RESERVATION_STATUSES } from "@/lib/business-rules";
+
+const createSchema = z.object({
+  equipmentId: z.string().min(1, "Equipment is required"),
+  startAt: dateString,
+  endAt: dateString,
+  purpose: z.string().trim().max(500).optional().nullable(),
+});
 
 export async function GET(req: NextRequest) {
-  return withAuth(async (session) => {
-    const sp = req.nextUrl.searchParams;
+  return withAuth(req, async (ctx) => {
+    const sp = ctx.searchParams;
     const status = sp.get("status")?.trim() ?? "";
     const equipmentId = sp.get("equipmentId")?.trim() ?? "";
+    const q = sp.get("q")?.trim() ?? "";
 
     const where: Prisma.ReservationWhereInput = {
-      organizationId: session.orgId,
+      organizationId: ctx.session.orgId,
       ...(status ? { status } : {}),
       ...(equipmentId ? { equipmentId } : {}),
+      ...(q
+        ? {
+            OR: [
+              { purpose: { contains: q } },
+              { equipment: { is: { OR: [{ name: { contains: q } }, { code: { contains: q } }] } } },
+              { user: { is: { name: { contains: q } } } },
+            ],
+          }
+        : {}),
     };
 
     const reservations = await db.reservation.findMany({
       where,
       include: {
-        equipment: { select: { id: true, name: true, code: true } },
+        equipment: { select: { id: true, name: true, code: true, status: true } },
         user: { select: { id: true, name: true } },
       },
       orderBy: { startAt: "desc" },
     });
     return ok(reservations);
-  });
+  }, "reservations.read");
 }
 
 export async function POST(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{
-      equipmentId?: string;
-      startAt?: string;
-      endAt?: string;
-      purpose?: string;
-    }>(req);
-
-    if (!b.equipmentId || !b.startAt || !b.endAt) {
-      return fail("Equipment, startAt and endAt are required");
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, createSchema);
+    if (data.endAt.getTime() <= data.startAt.getTime()) {
+      throw ValidationError("endAt must be after startAt");
     }
 
-    const startAt = new Date(b.startAt);
-    if (Number.isNaN(startAt.getTime())) return fail("Invalid startAt date", 400);
-    const endAt = new Date(b.endAt);
-    if (Number.isNaN(endAt.getTime())) return fail("Invalid endAt date", 400);
-    if (endAt <= startAt) return fail("endAt must be after startAt", 400);
+    const reservation = await db.$transaction(async (tx) => {
+      const equipment = await tx.equipment.findFirst({
+        where: { id: data.equipmentId, organizationId: ctx.session.orgId },
+      });
+      assertCanReserve(equipment); // 404 / 409 for retired / under-maintenance
 
-    const equipment = await db.equipment.findFirst({
-      where: { id: b.equipmentId, organizationId: session.orgId },
-    });
-    if (!equipment) return fail("Equipment not found in your organization", 404);
+      const existing = await tx.reservation.findMany({
+        where: {
+          organizationId: ctx.session.orgId,
+          equipmentId: data.equipmentId,
+          status: { in: [...ACTIVE_RESERVATION_STATUSES] },
+        },
+        select: { startAt: true, endAt: true },
+      });
+      if (findOverlap(existing, { startAt: data.startAt, endAt: data.endAt })) {
+        throw ConflictError(
+          "This equipment already has a reservation overlapping the selected time slot"
+        );
+      }
 
-    // Overlap check: NOT (endAt <= newStart OR startAt >= newEnd)
-    const overlapping = await db.reservation.count({
-      where: {
-        organizationId: session.orgId,
-        equipmentId: b.equipmentId,
-        status: { in: ["PENDING", "APPROVED"] },
-        NOT: [{ OR: [{ endAt: { lte: startAt } }, { startAt: { gte: endAt } }] }],
-      },
-    });
-    if (overlapping > 0) {
-      return fail("This equipment already has a reservation overlapping the selected time slot", 409);
-    }
+      const created = await tx.reservation.create({
+        data: {
+          organizationId: ctx.session.orgId,
+          equipmentId: data.equipmentId,
+          userId: ctx.session.userId,
+          startAt: data.startAt,
+          endAt: data.endAt,
+          purpose: data.purpose ?? null,
+          status: "PENDING",
+        },
+        include: {
+          equipment: { select: { id: true, name: true, code: true, status: true } },
+          user: { select: { id: true, name: true } },
+        },
+      });
 
-    const reservation = await db.reservation.create({
-      data: {
-        organizationId: session.orgId,
-        equipmentId: b.equipmentId,
-        userId: session.userId,
-        startAt,
-        endAt,
-        purpose: b.purpose ?? null,
-        status: "PENDING",
-      },
-      include: {
-        equipment: { select: { id: true, name: true, code: true } },
-        user: { select: { id: true, name: true } },
-      },
+      await recordEquipmentEvent(tx, {
+        organizationId: ctx.session.orgId,
+        equipmentId: data.equipmentId,
+        type: "RESERVED",
+        notes: `Reserved ${created.startAt.toISOString()} → ${created.endAt.toISOString()}${
+          created.purpose ? ` — ${created.purpose}` : ""
+        }`,
+        actorId: ctx.session.userId,
+      });
+
+      return created;
     });
-    await audit(session.orgId, session.userId, "RESERVATION_CREATED", "Reservation", reservation.id, {
-      equipment: equipment.name,
-      startAt: startAt.toISOString(),
-      endAt: endAt.toISOString(),
+
+    await audit(ctx.session.orgId, ctx.session.userId, "RESERVATION_CREATED", "Reservation", reservation.id, {
+      equipment: reservation.equipment.name,
+      startAt: reservation.startAt.toISOString(),
+      endAt: reservation.endAt.toISOString(),
     });
     return ok(reservation, 201);
-  });
+  }, "reservations.create");
 }

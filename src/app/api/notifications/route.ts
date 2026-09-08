@@ -1,34 +1,60 @@
 import { NextRequest } from "next/server";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth } from "@/lib/api";
+import { ok, withAuth } from "@/lib/api";
+import { parseBody } from "@/lib/validation";
+import { NotFoundError } from "@/lib/errors";
 
-export async function GET() {
-  return withAuth(async (session) => {
-    const notifications = await db.notification.findMany({
-      // Latest 20 for this user OR org-wide notifications (userId null)
-      where: {
-        organizationId: session.orgId,
-        OR: [{ userId: session.userId }, { userId: null }],
-      },
-      orderBy: { createdAt: "desc" },
-      take: 20,
-    });
-    return ok(notifications);
+// Latest 25 notifications: the user's own + org-wide (userId null), plus the
+// unread count across that same visible set.
+export async function GET(req: NextRequest) {
+  return withAuth(req, async (ctx) => {
+    const visibleWhere = {
+      organizationId: ctx.session.orgId,
+      OR: [{ userId: ctx.session.userId }, { userId: null }],
+    };
+
+    const [items, unreadCount] = await Promise.all([
+      db.notification.findMany({
+        where: visibleWhere,
+        include: { user: { select: { id: true, name: true } } },
+        orderBy: { createdAt: "desc" },
+        take: 25,
+      }),
+      db.notification.count({ where: { ...visibleWhere, read: false } }),
+    ]);
+
+    return ok({ items, unreadCount });
   });
 }
 
-export async function PATCH(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{ markAllRead?: boolean }>(req);
-    if (!b.markAllRead) return fail("markAllRead must be true", 400);
+const patchSchema = z
+  .object({
+    id: z.string().min(1).optional(),
+    markAllRead: z.boolean().optional(),
+  })
+  .refine((v) => v.id || v.markAllRead, { message: "Provide a notification id or markAllRead: true" });
 
-    // Only mark the user's own notifications as read — org-wide ones stay untouched
+export async function PATCH(req: NextRequest) {
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, patchSchema);
+    const visibleWhere = {
+      organizationId: ctx.session.orgId,
+      OR: [{ userId: ctx.session.userId }, { userId: null }],
+    };
+
+    if (data.id) {
+      const res = await db.notification.updateMany({
+        where: { ...visibleWhere, id: data.id },
+        data: { read: true },
+      });
+      if (res.count === 0) throw NotFoundError("Notification not found");
+      return ok({ success: true, count: res.count });
+    }
+
+    // markAllRead — every notification visible to this user
     const res = await db.notification.updateMany({
-      where: {
-        organizationId: session.orgId,
-        userId: session.userId,
-        read: false,
-      },
+      where: { ...visibleWhere, read: false },
       data: { read: true },
     });
     return ok({ success: true, count: res.count });

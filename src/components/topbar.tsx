@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
-import { Moon, Sun, LogOut, User, ShieldCheck } from "lucide-react";
+import { Moon, Sun, LogOut, ShieldCheck } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,10 +15,22 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
+import { NotificationBell } from "@/components/notification-bell";
+import { SearchTriggerButton } from "@/components/global-search";
 import { ROLE_LABELS } from "@/lib/constants";
 import { toast } from "@/hooks/use-toast";
 
-export function Topbar({ name, email, role }: { name: string; email: string; role: string }) {
+export function Topbar({
+  name,
+  email,
+  role,
+  onOpenSearch,
+}: {
+  name: string;
+  email: string;
+  role: string;
+  onOpenSearch: () => void;
+}) {
   const router = useRouter();
   const { theme, setTheme } = useTheme();
 
@@ -41,6 +53,8 @@ export function Topbar({ name, email, role }: { name: string; email: string; rol
       <SidebarTrigger className="-ml-1" aria-label="Toggle sidebar" />
       <Separator orientation="vertical" className="mr-2 h-4" />
       <div className="flex-1" />
+      <SearchTriggerButton onOpen={onOpenSearch} />
+      <NotificationBell />
       <Button
         variant="ghost"
         size="icon"

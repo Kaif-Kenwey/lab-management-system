@@ -92,7 +92,7 @@ async function fetcher(url: string) {
   const res = await fetch(url);
   if (!res.ok) {
     const d = await res.json().catch(() => ({}));
-    throw new Error(d.error || "Request failed");
+    throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Request failed");
   }
   return res.json();
 }
@@ -159,7 +159,7 @@ function LabDetailContent() {
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Failed to update lab");
+        throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Failed to update lab");
       }
       return res.json();
     },
@@ -324,7 +324,11 @@ function LabDetailContent() {
                     <TableBody>
                       {data.equipment!.map((eq) => (
                         <TableRow key={eq.id}>
-                          <TableCell className="font-medium">{eq.name}</TableCell>
+                          <TableCell className="font-medium">
+                            <Link href={`/equipment/${eq.id}`} className="hover:underline">
+                              {eq.name}
+                            </Link>
+                          </TableCell>
                           <TableCell className="font-mono text-xs text-muted-foreground">{eq.code}</TableCell>
                           <TableCell className="text-muted-foreground">
                             {eq.category.replace(/_/g, " ")}

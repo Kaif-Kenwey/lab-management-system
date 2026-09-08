@@ -1,79 +1,79 @@
 import { NextRequest } from "next/server";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody, mapPrismaError } from "@/lib/validation";
 import { ROLES } from "@/lib/constants";
+import { NotFoundError, ValidationError } from "@/lib/errors";
+
+const userSelect = {
+  id: true,
+  name: true,
+  email: true,
+  role: true,
+  department: true,
+  status: true,
+  phone: true,
+  createdAt: true,
+} as const;
+
+const updateUserSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  role: z.enum(ROLES).optional(),
+  status: z.enum(["ACTIVE", "SUSPENDED"]).optional(),
+  department: z.string().trim().max(120).nullish(),
+});
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{
-      role?: string;
-      status?: string;
-      name?: string;
-      department?: string;
-    }>(req);
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, updateUserSchema);
 
-    if (b.role && !(ROLES as readonly string[]).includes(b.role)) {
-      return fail(`Invalid role — must be one of: ${ROLES.join(", ")}`);
-    }
-    if (b.status && !["ACTIVE", "SUSPENDED"].includes(b.status)) {
-      return fail("Invalid status — must be ACTIVE or SUSPENDED");
-    }
-
-    const user = await db.user.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!user) return fail("User not found", 404);
-
-    const data: Prisma.UserUncheckedUpdateInput = {};
-    if (b.role !== undefined) data.role = b.role;
-    if (b.status !== undefined) data.status = b.status;
-    if (b.name !== undefined) data.name = b.name.trim();
-    if (b.department !== undefined) data.department = b.department ?? null;
+    const user = await db.user.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
+      select: { id: true, name: true },
+    });
+    if (!user) throw NotFoundError("User not found");
 
     const updated = await db.user.update({
       where: { id },
-      data,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        department: true,
-        status: true,
-        createdAt: true,
+      data: {
+        ...(data.name !== undefined ? { name: data.name } : {}),
+        ...(data.role !== undefined ? { role: data.role } : {}),
+        ...(data.status !== undefined ? { status: data.status } : {}),
+        ...(data.department !== undefined ? { department: data.department ?? null } : {}),
       },
+      select: userSelect,
     });
-    await audit(session.orgId, session.userId, "USER_UPDATED", "User", id, {
+    await audit(ctx.session.orgId, ctx.session.userId, "USER_UPDATED", "User", id, {
+      name: updated.name,
       role: updated.role,
       status: updated.status,
     });
     return ok(updated);
-  }, ["ADMIN"]);
+  }, "users.manage");
 }
 
-export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    if (session.userId === id) return fail("You cannot delete your own account", 400);
-
-    const user = await db.user.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!user) return fail("User not found", 404);
+  return withAuth(req, async (ctx) => {
+    if (id === ctx.session.userId) {
+      throw ValidationError("You cannot delete your own account");
+    }
+    const user = await db.user.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
+      select: { id: true, name: true },
+    });
+    if (!user) throw NotFoundError("User not found");
 
     try {
       await db.user.delete({ where: { id } });
-      await audit(session.orgId, session.userId, "USER_DELETED", "User", id, {
+      await audit(ctx.session.orgId, ctx.session.userId, "USER_DELETED", "User", id, {
         name: user.name,
-        email: user.email,
       });
       return ok({ success: true });
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2003") {
-        return fail(
-          "This user has related records (reservations, checkouts, incidents, etc.) and cannot be deleted",
-          409
-        );
-      }
-      throw e;
+      mapPrismaError(e, "User is still referenced by other records");
     }
-  }, ["ADMIN"]);
+  }, "users.manage");
 }

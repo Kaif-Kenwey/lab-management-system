@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      # PostgreSQL profile — the entrypoint switches the Prisma provider
+      DATABASE_URL: postgresql://labvault:labvault@db:5432/labvault
+      JWT_SECRET: change-me-to-a-long-random-string
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: labvault
+      POSTGRES_PASSWORD: labvault
+      POSTGRES_DB: labvault
+    volumes:
+      - labvault_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U labvault -d labvault"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  labvault_pgdata:

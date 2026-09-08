@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   QueryClient,
   QueryClientProvider,
@@ -11,7 +12,7 @@ import {
 import { format } from "date-fns";
 import { CalendarPlus, Loader2, Timer } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
-import { RESERVATION_STATUS } from "@/lib/constants";
+import { apiFetch, apiJson } from "@/lib/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -33,6 +34,17 @@ import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { StatusBadge } from "@/components/shared/status-badge";
 
+const STATUS_TABS = [
+  "ALL",
+  "PENDING",
+  "APPROVED",
+  "ACTIVE",
+  "COMPLETED",
+  "NO_SHOW",
+  "REJECTED",
+  "CANCELLED",
+] as const;
+
 type ReservationRow = {
   id: string;
   equipmentId: string;
@@ -47,16 +59,10 @@ type ReservationRow = {
 
 type EquipmentOption = { id: string; name: string; code: string; status: string };
 
-type Me = { session: { userId: string; role: string; name: string } };
-
-async function fetcher(url: string) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    const d = await res.json().catch(() => ({}));
-    throw new Error(d.error || "Request failed");
-  }
-  return res.json();
-}
+type Me = {
+  session: { userId: string; role: string; name: string };
+  permissions?: string[];
+};
 
 function fmt(v?: string | null) {
   if (!v) return "—";
@@ -73,87 +79,96 @@ export default function ReservationsPage() {
   const [queryClient] = useState(() => new QueryClient());
   return (
     <QueryClientProvider client={queryClient}>
-      <ReservationsContent />
+      <Suspense
+        fallback={
+          <div className="space-y-6">
+            <Skeleton className="h-9 w-64" />
+            <Skeleton className="h-9 w-full max-w-xl" />
+            <Skeleton className="h-72 rounded-xl" />
+          </div>
+        }
+      >
+        <ReservationsContent />
+      </Suspense>
     </QueryClientProvider>
   );
 }
 
 function ReservationsContent() {
   const queryClient = useQueryClient();
-  const [status, setStatus] = useState("ALL");
-  const [createOpen, setCreateOpen] = useState(false);
+  const searchParams = useSearchParams();
+  const equipmentParam = searchParams.get("equipment") ?? "";
+  const statusParam = searchParams.get("status") ?? "";
+  const openParam = searchParams.get("open") === "1";
+
+  const initialStatus = STATUS_TABS.includes(statusParam as (typeof STATUS_TABS)[number])
+    ? statusParam
+    : "ALL";
+
+  const [status, setStatus] = useState(initialStatus);
+  const [createOpen, setCreateOpen] = useState(openParam);
   const [form, setForm] = useState(emptyForm);
 
-  const me = useQuery<Me>({ queryKey: ["me"], queryFn: () => fetcher("/api/auth/me") });
+  // Deep links: /reservations?equipment={id}&open=1 preselects equipment in the
+  // create dialog and filters the table down to that equipment.
+  useEffect(() => {
+    if (equipmentParam) {
+      setForm((f) => ({ ...f, equipmentId: equipmentParam }));
+    }
+  }, [equipmentParam]);
+
+  useEffect(() => {
+    setStatus(initialStatus);
+  }, [initialStatus]);
+
+  const me = useQuery<Me>({ queryKey: ["me"], queryFn: () => apiFetch<Me>("/api/auth/me") });
   const equipmentOptions = useQuery<EquipmentOption[]>({
     queryKey: ["equipment-options"],
-    queryFn: () => fetcher("/api/equipment"),
+    queryFn: () => apiFetch<EquipmentOption[]>("/api/equipment"),
   });
 
+  const params = new URLSearchParams();
+  if (status !== "ALL") params.set("status", status);
+  if (equipmentParam) params.set("equipmentId", equipmentParam);
+  const qs = params.toString();
+
   const reservations = useQuery<ReservationRow[]>({
-    queryKey: ["reservations", status],
-    queryFn: () => fetcher(`/api/reservations${status !== "ALL" ? `?status=${status}` : ""}`),
+    queryKey: ["reservations", { status, equipmentId: equipmentParam }],
+    queryFn: () => apiFetch<ReservationRow[]>(`/api/reservations${qs ? `?${qs}` : ""}`),
   });
 
   const role = me.data?.session?.role;
   const myId = me.data?.session?.userId;
-  const canApprove = role === "ADMIN" || role === "LAB_MANAGER";
-
-  useEffect(() => {
-    if (reservations.isError) {
-      toast({
-        title: "Failed to load reservations",
-        description:
-          reservations.error instanceof Error ? reservations.error.message : "Something went wrong",
-        variant: "destructive",
-      });
-    }
-  }, [reservations.isError, reservations.error]);
+  const permissions = me.data?.permissions ?? [];
+  const canApprove =
+    permissions.includes("reservations.approve") || role === "ADMIN" || role === "LAB_MANAGER";
 
   const patchStatus = useMutation({
-    mutationFn: async ({ id, status }: { id: string; status: string }) => {
-      const res = await fetch(`/api/reservations/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
-      });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Request failed");
-      }
-      return res.json();
-    },
+    mutationFn: async ({ id, status }: { id: string; status: string }) =>
+      apiJson(`/api/reservations/${id}`, "PATCH", { status }),
     onSuccess: (_d, vars) => {
       queryClient.invalidateQueries({ queryKey: ["reservations"] });
-      toast({ title: `Reservation ${vars.status.toLowerCase()}` });
+      queryClient.invalidateQueries({ queryKey: ["attention"] });
+      toast({ title: `Reservation ${vars.status.toLowerCase().replace(/_/g, " ")}` });
     },
     onError: (e: Error) =>
       toast({ title: "Update failed", description: e.message, variant: "destructive" }),
   });
 
   const createReservation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch("/api/reservations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          equipmentId: form.equipmentId,
-          startAt: form.startAt ? new Date(form.startAt).toISOString() : "",
-          endAt: form.endAt ? new Date(form.endAt).toISOString() : "",
-          purpose: form.purpose.trim() || null,
-        }),
-      });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Request failed");
-      }
-      return res.json();
-    },
+    mutationFn: async () =>
+      apiJson("/api/reservations", "POST", {
+        equipmentId: form.equipmentId,
+        startAt: form.startAt ? new Date(form.startAt).toISOString() : "",
+        endAt: form.endAt ? new Date(form.endAt).toISOString() : "",
+        purpose: form.purpose.trim() || null,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["reservations"] });
+      queryClient.invalidateQueries({ queryKey: ["attention"] });
       toast({ title: "Reservation requested" });
       setCreateOpen(false);
-      setForm(emptyForm);
+      setForm({ ...emptyForm, equipmentId: equipmentParam });
     },
     onError: (e: Error) =>
       toast({ title: "Could not create reservation", description: e.message, variant: "destructive" }),
@@ -163,7 +178,116 @@ function ReservationsContent() {
     return !!myId && (row.userId === myId || row.user?.id === myId);
   }
 
+  function actionsFor(row: ReservationRow) {
+    const buttons: React.ReactNode[] = [];
+    const busy = patchStatus.isPending;
+
+    if (row.status === "PENDING") {
+      if (canApprove) {
+        buttons.push(
+          <Button
+            key="approve"
+            size="sm"
+            variant="outline"
+            className="h-8 border-emerald-200 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950"
+            disabled={busy}
+            onClick={() => patchStatus.mutate({ id: row.id, status: "APPROVED" })}
+          >
+            Approve
+          </Button>,
+          <Button
+            key="reject"
+            size="sm"
+            variant="outline"
+            className="h-8 border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950"
+            disabled={busy}
+            onClick={() => patchStatus.mutate({ id: row.id, status: "REJECTED" })}
+          >
+            Reject
+          </Button>
+        );
+      }
+      if (isOwner(row)) {
+        buttons.push(
+          <Button
+            key="cancel"
+            size="sm"
+            variant="ghost"
+            className="h-8 text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+            disabled={busy}
+            onClick={() => patchStatus.mutate({ id: row.id, status: "CANCELLED" })}
+          >
+            Cancel
+          </Button>
+        );
+      }
+    }
+
+    if (row.status === "APPROVED") {
+      if (canApprove || isOwner(row)) {
+        buttons.push(
+          <Button
+            key="start"
+            size="sm"
+            variant="outline"
+            className="h-8 border-sky-200 text-sky-700 hover:bg-sky-50 dark:border-sky-900 dark:text-sky-400 dark:hover:bg-sky-950"
+            disabled={busy}
+            onClick={() => patchStatus.mutate({ id: row.id, status: "ACTIVE" })}
+          >
+            Start
+          </Button>
+        );
+      }
+      if (canApprove) {
+        buttons.push(
+          <Button
+            key="noshow"
+            size="sm"
+            variant="ghost"
+            className="h-8 text-amber-700 hover:text-amber-800 dark:text-amber-400 dark:hover:text-amber-300"
+            disabled={busy}
+            onClick={() => patchStatus.mutate({ id: row.id, status: "NO_SHOW" })}
+          >
+            No-show
+          </Button>
+        );
+      }
+      if (canApprove || isOwner(row)) {
+        buttons.push(
+          <Button
+            key="cancel"
+            size="sm"
+            variant="ghost"
+            className="h-8 text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+            disabled={busy}
+            onClick={() => patchStatus.mutate({ id: row.id, status: "CANCELLED" })}
+          >
+            Cancel
+          </Button>
+        );
+      }
+    }
+
+    if (row.status === "ACTIVE" && (canApprove || isOwner(row))) {
+      buttons.push(
+        <Button
+          key="complete"
+          size="sm"
+          variant="outline"
+          className="h-8 border-emerald-200 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950"
+          disabled={busy}
+          onClick={() => patchStatus.mutate({ id: row.id, status: "COMPLETED" })}
+        >
+          Complete
+        </Button>
+      );
+    }
+
+    return buttons;
+  }
+
   const rows = reservations.data ?? [];
+  const selectedEquipment = (equipmentOptions.data ?? []).find((e) => e.id === equipmentParam);
   const canSubmit =
     form.equipmentId !== "" && form.startAt !== "" && form.endAt !== "" && !createReservation.isPending;
 
@@ -173,19 +297,39 @@ function ReservationsContent() {
         title="Reservations"
         description="Equipment bookings and approval queue"
         actions={
-          <Button onClick={() => setCreateOpen(true)}>
+          <Button
+            onClick={() => {
+              if (equipmentParam) setForm((f) => ({ ...f, equipmentId: equipmentParam }));
+              setCreateOpen(true);
+            }}
+          >
             <CalendarPlus className="h-4 w-4 mr-1.5" aria-hidden="true" />
             New Reservation
           </Button>
         }
       />
 
+      {equipmentParam ? (
+        <p className="text-sm text-muted-foreground">
+          Filtered to equipment{" "}
+          <span className="font-medium text-foreground">
+            {selectedEquipment ? `${selectedEquipment.name} (${selectedEquipment.code})` : equipmentParam}
+          </span>
+          .{" "}
+          <a
+            href="/reservations"
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            Clear filter
+          </a>
+        </p>
+      ) : null}
+
       <Tabs value={status} onValueChange={setStatus}>
         <TabsList className="flex flex-wrap h-auto">
-          <TabsTrigger value="ALL">All</TabsTrigger>
-          {RESERVATION_STATUS.map((s) => (
+          {STATUS_TABS.map((s) => (
             <TabsTrigger key={s} value={s}>
-              {s.replace(/_/g, " ")}
+              {s === "ALL" ? "All" : s.replace(/_/g, " ")}
             </TabsTrigger>
           ))}
         </TabsList>
@@ -199,18 +343,41 @@ function ReservationsContent() {
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
+          ) : reservations.isError ? (
+            <div className="p-6">
+              <EmptyState
+                icon={Timer}
+                title="Failed to load reservations"
+                description={
+                  reservations.error instanceof Error
+                    ? reservations.error.message
+                    : "Something went wrong"
+                }
+                action={
+                  <Button variant="outline" onClick={() => reservations.refetch()} disabled={reservations.isRefetching}>
+                    Try again
+                  </Button>
+                }
+              />
+            </div>
           ) : rows.length === 0 ? (
             <div className="p-6">
               <EmptyState
                 icon={Timer}
                 title="No reservations"
                 description={
-                  status !== "ALL"
-                    ? "No reservations with this status yet."
+                  status !== "ALL" || equipmentParam
+                    ? "No reservations match the current filters."
                     : "Book equipment by creating a reservation request."
                 }
                 action={
-                  <Button variant="outline" onClick={() => setCreateOpen(true)}>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      if (equipmentParam) setForm((f) => ({ ...f, equipmentId: equipmentParam }));
+                      setCreateOpen(true);
+                    }}
+                  >
                     <CalendarPlus className="h-4 w-4 mr-1.5" aria-hidden="true" />
                     New Reservation
                   </Button>
@@ -232,68 +399,39 @@ function ReservationsContent() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {rows.map((row) => (
-                    <TableRow key={row.id}>
-                      <TableCell>
-                        <div className="font-medium">{row.equipment?.name || "—"}</div>
-                        {row.equipment?.code ? (
-                          <div className="text-xs font-mono text-muted-foreground">{row.equipment.code}</div>
-                        ) : null}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">{row.user?.name || "—"}</TableCell>
-                      <TableCell className="text-muted-foreground whitespace-nowrap">
-                        {fmt(row.startAt)}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground whitespace-nowrap">
-                        {fmt(row.endAt)}
-                      </TableCell>
-                      <TableCell className="max-w-52">
-                        <span className="text-sm text-muted-foreground line-clamp-2">
-                          {row.purpose || "—"}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <StatusBadge status={row.status} />
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center justify-end gap-1.5">
-                          {canApprove && row.status === "PENDING" ? (
-                            <>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-8 border-emerald-200 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950"
-                                disabled={patchStatus.isPending}
-                                onClick={() => patchStatus.mutate({ id: row.id, status: "APPROVED" })}
-                              >
-                                Approve
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-8 border-red-200 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950"
-                                disabled={patchStatus.isPending}
-                                onClick={() => patchStatus.mutate({ id: row.id, status: "REJECTED" })}
-                              >
-                                Reject
-                              </Button>
-                            </>
+                  {rows.map((row) => {
+                    const actions = actionsFor(row);
+                    return (
+                      <TableRow key={row.id}>
+                        <TableCell>
+                          <div className="font-medium">{row.equipment?.name || "—"}</div>
+                          {row.equipment?.code ? (
+                            <div className="text-xs font-mono text-muted-foreground">{row.equipment.code}</div>
                           ) : null}
-                          {isOwner(row) && (row.status === "PENDING" || row.status === "APPROVED") ? (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-8 text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
-                              disabled={patchStatus.isPending}
-                              onClick={() => patchStatus.mutate({ id: row.id, status: "CANCELLED" })}
-                            >
-                              Cancel
-                            </Button>
-                          ) : null}
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                        </TableCell>
+                        <TableCell className="text-muted-foreground">{row.user?.name || "—"}</TableCell>
+                        <TableCell className="text-muted-foreground whitespace-nowrap">
+                          {fmt(row.startAt)}
+                        </TableCell>
+                        <TableCell className="text-muted-foreground whitespace-nowrap">
+                          {fmt(row.endAt)}
+                        </TableCell>
+                        <TableCell className="max-w-52">
+                          <span className="text-sm text-muted-foreground line-clamp-2">
+                            {row.purpose || "—"}
+                          </span>
+                        </TableCell>
+                        <TableCell>
+                          <StatusBadge status={row.status} />
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center justify-end gap-1.5">
+                            {actions.length > 0 ? actions : <span className="text-xs text-muted-foreground">—</span>}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>

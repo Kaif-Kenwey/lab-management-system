@@ -1,80 +1,174 @@
 import { NextRequest } from "next/server";
-import { Prisma, PrismaPromise } from "@prisma/client";
+import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { NotFoundError } from "@/lib/errors";
+import { parseBody, dateString } from "@/lib/validation";
+import { recordEquipmentEvent } from "@/lib/lifecycle";
+import { notify } from "@/lib/notify";
+import { assertMaintenanceTransition } from "@/lib/business-rules";
+import { MAINTENANCE_STATUS, MAINTENANCE_ACTIVE_STATUSES, MAINTENANCE_TYPE, MAINTENANCE_PRIORITY } from "@/lib/constants";
 
-const MAINTENANCE_STATUSES = ["SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED"];
+const patchSchema = z.object({
+  status: z.enum(MAINTENANCE_STATUS).optional(),
+  technicianId: z.string().min(1).nullable().optional(),
+  title: z.string().trim().min(1).max(200).optional(),
+  issue: z.string().trim().max(2000).optional().nullable(),
+  type: z.enum(MAINTENANCE_TYPE).optional(),
+  priority: z.enum(MAINTENANCE_PRIORITY).optional(),
+  scheduledAt: dateString.optional().nullable(),
+  laborCost: z.coerce.number().min(0).optional(),
+  partsCost: z.coerce.number().min(0).optional(),
+  notes: z.string().trim().max(2000).optional().nullable(),
+});
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{
-      status?: string;
-      type?: string;
-      scheduledAt?: string;
-      technicianId?: string | null;
-      cost?: number | string;
-      notes?: string | null;
-    }>(req);
-
-    if (b.status && !MAINTENANCE_STATUSES.includes(b.status)) {
-      return fail(`Invalid status — must be one of: ${MAINTENANCE_STATUSES.join(", ")}`);
-    }
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, patchSchema);
 
     const record = await db.maintenanceRecord.findFirst({
-      where: { id, organizationId: session.orgId },
-    });
-    if (!record) return fail("Maintenance record not found", 404);
-
-    if (b.technicianId) {
-      const technician = await db.user.findFirst({
-        where: { id: b.technicianId, organizationId: session.orgId },
-      });
-      if (!technician) return fail("Technician not found in your organization", 404);
-    }
-
-    const data: Prisma.MaintenanceRecordUncheckedUpdateInput = {};
-    if (b.status !== undefined) data.status = b.status;
-    if (b.type !== undefined) data.type = b.type;
-    if (b.scheduledAt !== undefined) {
-      const scheduledAt = new Date(b.scheduledAt);
-      if (Number.isNaN(scheduledAt.getTime())) return fail("Invalid scheduledAt date", 400);
-      data.scheduledAt = scheduledAt;
-    }
-    if (b.technicianId !== undefined) data.technicianId = b.technicianId;
-    if (b.cost !== undefined) {
-      const cost = Number(b.cost);
-      if (Number.isNaN(cost) || cost < 0) return fail("Cost must be a non-negative number");
-      data.cost = cost;
-    }
-    if (b.notes !== undefined) data.notes = b.notes;
-    if (b.status === "COMPLETED") data.completedAt = new Date();
-
-    // Sync equipment status with maintenance progress
-    const ops: PrismaPromise<unknown>[] = [db.maintenanceRecord.update({ where: { id }, data })];
-    if (b.status === "IN_PROGRESS") {
-      ops.push(
-        db.equipment.update({ where: { id: record.equipmentId }, data: { status: "UNDER_MAINTENANCE" } })
-      );
-    } else if (b.status === "COMPLETED") {
-      ops.push(
-        db.equipment.update({ where: { id: record.equipmentId }, data: { status: "AVAILABLE" } })
-      );
-    }
-    await db.$transaction(ops);
-
-    const updated = await db.maintenanceRecord.findUnique({
-      where: { id },
+      where: { id, organizationId: ctx.session.orgId },
       include: {
-        equipment: { select: { id: true, name: true, code: true } },
+        equipment: { select: { id: true, name: true, code: true, status: true } },
         technician: { select: { id: true, name: true } },
       },
     });
+    if (!record) throw NotFoundError("Maintenance work order not found");
 
-    await audit(session.orgId, session.userId, "MAINTENANCE_UPDATED", "MaintenanceRecord", id, {
-      status: updated?.status ?? b.status,
-      equipment: updated?.equipment.name,
+    // Assigning a technician to an OPEN work order (without an explicit
+    // status) auto-transitions OPEN → ASSIGNED, mirroring POST behaviour.
+    let newStatus = data.status;
+    if (!newStatus && data.technicianId && record.status === "OPEN") {
+      newStatus = "ASSIGNED";
+    }
+    if (newStatus && newStatus !== record.status) {
+      assertMaintenanceTransition(record.status, newStatus); // 409 on illegal moves
+    }
+
+    const now = new Date();
+    const laborCost = data.laborCost ?? record.laborCost;
+    const partsCost = data.partsCost ?? record.partsCost;
+
+    const startedAt =
+      newStatus === "IN_PROGRESS" && !record.startedAt ? now : record.startedAt;
+    const completedAt = newStatus === "COMPLETED" ? now : record.completedAt;
+    const downtimeHours =
+      newStatus === "COMPLETED" && startedAt && completedAt
+        ? Math.round(((completedAt.getTime() - startedAt.getTime()) / 3_600_000) * 100) / 100
+        : record.downtimeHours;
+
+    const updated = await db.$transaction(async (tx) => {
+      const row = await tx.maintenanceRecord.update({
+        where: { id },
+        data: {
+          ...(newStatus ? { status: newStatus } : {}),
+          ...(data.technicianId !== undefined ? { technicianId: data.technicianId } : {}),
+          ...(data.title !== undefined ? { title: data.title } : {}),
+          ...(data.issue !== undefined ? { issue: data.issue } : {}),
+          ...(data.type !== undefined ? { type: data.type } : {}),
+          ...(data.priority !== undefined ? { priority: data.priority } : {}),
+          ...(data.scheduledAt !== undefined ? { scheduledAt: data.scheduledAt } : {}),
+          ...(data.notes !== undefined ? { notes: data.notes } : {}),
+          ...(data.laborCost !== undefined || data.partsCost !== undefined || newStatus === "COMPLETED"
+            ? { laborCost, partsCost, cost: laborCost + partsCost }
+            : {}),
+          startedAt,
+          completedAt,
+          downtimeHours,
+        } as Prisma.MaintenanceRecordUncheckedUpdateInput,
+        include: {
+          equipment: { select: { id: true, name: true, code: true, status: true } },
+          technician: { select: { id: true, name: true } },
+        },
+      });
+
+      const equipmentId = record.equipment.id;
+
+      if (newStatus === "IN_PROGRESS") {
+        await tx.equipment.update({
+          where: { id: equipmentId },
+          data: { status: "UNDER_MAINTENANCE" },
+        });
+        await recordEquipmentEvent(tx, {
+          organizationId: ctx.session.orgId,
+          equipmentId,
+          type: "MAINTENANCE_STARTED",
+          previousStatus: record.equipment.status,
+          newStatus: "UNDER_MAINTENANCE",
+          notes: `${record.title} — work started`,
+          actorId: ctx.session.userId,
+        });
+      } else if (newStatus === "COMPLETED" || newStatus === "CANCELLED") {
+        const otherActive = await tx.maintenanceRecord.count({
+          where: {
+            organizationId: ctx.session.orgId,
+            equipmentId,
+            id: { not: id },
+            status: { in: [...MAINTENANCE_ACTIVE_STATUSES] },
+          },
+        });
+        if (otherActive === 0 && record.equipment.status === "UNDER_MAINTENANCE") {
+          await tx.equipment.update({
+            where: { id: equipmentId },
+            data: { status: "AVAILABLE" },
+          });
+          await recordEquipmentEvent(tx, {
+            organizationId: ctx.session.orgId,
+            equipmentId,
+            type: newStatus === "COMPLETED" ? "MAINTENANCE_COMPLETED" : "STATUS_CHANGED",
+            previousStatus: "UNDER_MAINTENANCE",
+            newStatus: "AVAILABLE",
+            notes:
+              newStatus === "COMPLETED"
+                ? `${record.title} — back in service`
+                : `${record.title} — work order cancelled`,
+            actorId: ctx.session.userId,
+          });
+        } else if (newStatus === "COMPLETED") {
+          await recordEquipmentEvent(tx, {
+            organizationId: ctx.session.orgId,
+            equipmentId,
+            type: "MAINTENANCE_COMPLETED",
+            notes: `${record.title} — completed (equipment still held by other active work orders)`,
+            actorId: ctx.session.userId,
+          });
+        }
+      }
+
+      // Assignment notifications (new assignment, reassignment, or explicit
+      // ASSIGNED transition)
+      const technicianId = data.technicianId !== undefined ? data.technicianId : record.technicianId;
+      const assigned = newStatus === "ASSIGNED" || (!!data.technicianId && data.technicianId !== record.technicianId);
+      if (assigned && technicianId) {
+        await notify(tx, {
+          organizationId: ctx.session.orgId,
+          userId: technicianId,
+          title: "Work order assigned to you",
+          body: `${row.title} — ${row.equipment.name} (${row.priority.toLowerCase()} priority).`,
+          type: "INFO",
+          entityType: "MaintenanceRecord",
+          entityId: row.id,
+        });
+      }
+
+      return row;
     });
+
+    await audit(
+      ctx.session.orgId,
+      ctx.session.userId,
+      newStatus === "ASSIGNED" ? "MAINTENANCE_ASSIGNED" : "MAINTENANCE_UPDATED",
+      "MaintenanceRecord",
+      id,
+      {
+        from: record.status,
+        to: newStatus ?? record.status,
+        equipment: record.equipment.name,
+        ...(newStatus === "COMPLETED" ? { downtimeHours, cost: laborCost + partsCost } : {}),
+      }
+    );
     return ok(updated);
-  }, ["ADMIN", "LAB_MANAGER", "TECHNICIAN"]);
+  }, "maintenance.manage");
 }

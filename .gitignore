@@ -35,3 +35,15 @@ prisma/*.db
 
 # vercel
 .vercel
+
+# playwright artifacts
+/test-results/
+/playwright-report/
+/blob-report/
+
+# test build dirs
+/.next-test/
+/.next-e2e/
+
+# uploaded documents
+/uploads/

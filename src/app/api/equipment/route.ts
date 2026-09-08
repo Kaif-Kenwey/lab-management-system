@@ -1,19 +1,40 @@
 import { NextRequest } from "next/server";
 import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { NotFoundError } from "@/lib/errors";
+import { parseBody, mapPrismaError, dateString } from "@/lib/validation";
+import { recordEquipmentEvent } from "@/lib/lifecycle";
+import { EQUIPMENT_STATUS, EQUIPMENT_CATEGORY, EQUIPMENT_CONDITION } from "@/lib/constants";
+
+const createSchema = z.object({
+  name: z.string().trim().min(1, "Name is required").max(200),
+  code: z.string().trim().min(1, "Code is required").max(60),
+  labId: z.string().min(1, "Lab is required"),
+  category: z.enum(EQUIPMENT_CATEGORY).optional(),
+  status: z.enum(EQUIPMENT_STATUS).optional(),
+  condition: z.enum(EQUIPMENT_CONDITION).optional(),
+  manufacturer: z.string().trim().max(200).optional().nullable(),
+  serialNumber: z.string().trim().max(200).optional().nullable(),
+  price: z.coerce.number().min(0).optional(),
+  purchaseDate: dateString.optional().nullable(),
+  warrantyUntil: dateString.optional().nullable(),
+});
 
 export async function GET(req: NextRequest) {
-  return withAuth(async (session) => {
-    const sp = req.nextUrl.searchParams;
+  return withAuth(req, async (ctx) => {
+    const sp = ctx.searchParams;
     const q = sp.get("q")?.trim() ?? "";
     const labId = sp.get("labId")?.trim() ?? "";
     const status = sp.get("status")?.trim() ?? "";
+    const category = sp.get("category")?.trim() ?? "";
 
     const where: Prisma.EquipmentWhereInput = {
-      organizationId: session.orgId,
+      organizationId: ctx.session.orgId,
       ...(labId ? { labId } : {}),
       ...(status ? { status } : {}),
+      ...(category ? { category } : {}),
       ...(q
         ? {
             OR: [
@@ -32,66 +53,55 @@ export async function GET(req: NextRequest) {
       orderBy: { createdAt: "desc" },
     });
     return ok(equipment);
-  });
+  }, "equipment.read");
 }
 
 export async function POST(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{
-      name?: string;
-      code?: string;
-      labId?: string;
-      category?: string;
-      manufacturer?: string;
-      serialNumber?: string;
-      price?: number | string;
-      purchaseDate?: string | null;
-      condition?: string;
-    }>(req);
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, createSchema);
 
-    if (!b.name?.trim() || !b.code?.trim() || !b.labId) {
-      return fail("Name, code and lab are required");
-    }
-
-    const lab = await db.lab.findFirst({ where: { id: b.labId, organizationId: session.orgId } });
-    if (!lab) return fail("Lab not found in your organization", 404);
-
-    const price =
-      b.price === undefined || b.price === null || b.price === "" ? 0 : Number(b.price);
-    if (Number.isNaN(price) || price < 0) return fail("Price must be a non-negative number");
-
-    let purchaseDate: Date | null = null;
-    if (b.purchaseDate) {
-      purchaseDate = new Date(b.purchaseDate);
-      if (Number.isNaN(purchaseDate.getTime())) return fail("Invalid purchaseDate", 400);
-    }
+    const lab = await db.lab.findFirst({
+      where: { id: data.labId, organizationId: ctx.session.orgId },
+    });
+    if (!lab) throw NotFoundError("Lab not found in your organization");
 
     try {
-      const equipment = await db.equipment.create({
-        data: {
-          organizationId: session.orgId,
-          labId: b.labId,
-          name: b.name.trim(),
-          code: b.code.trim(),
-          category: b.category ?? "GENERAL",
-          manufacturer: b.manufacturer ?? null,
-          serialNumber: b.serialNumber ?? null,
-          price,
-          purchaseDate,
-          condition: b.condition ?? "GOOD",
-        },
-        include: { lab: { select: { id: true, name: true, code: true } } },
+      const equipment = await db.$transaction(async (tx) => {
+        const created = await tx.equipment.create({
+          data: {
+            organizationId: ctx.session.orgId,
+            labId: data.labId,
+            name: data.name,
+            code: data.code,
+            category: data.category ?? "GENERAL",
+            status: data.status ?? "AVAILABLE",
+            condition: data.condition ?? "GOOD",
+            manufacturer: data.manufacturer ?? null,
+            serialNumber: data.serialNumber ?? null,
+            price: data.price ?? 0,
+            purchaseDate: data.purchaseDate ?? null,
+            warrantyUntil: data.warrantyUntil ?? null,
+          },
+          include: { lab: { select: { id: true, name: true, code: true } } },
+        });
+        await recordEquipmentEvent(tx, {
+          organizationId: ctx.session.orgId,
+          equipmentId: created.id,
+          type: "CREATED",
+          newStatus: created.status,
+          notes: `Asset registered in ${lab.name}`,
+          actorId: ctx.session.userId,
+        });
+        return created;
       });
-      await audit(session.orgId, session.userId, "EQUIPMENT_CREATED", "Equipment", equipment.id, {
+
+      await audit(ctx.session.orgId, ctx.session.userId, "EQUIPMENT_CREATED", "Equipment", equipment.id, {
         name: equipment.name,
         code: equipment.code,
       });
       return ok(equipment, 201);
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        return fail("Equipment with this code already exists in your organization", 409);
-      }
-      throw e;
+      mapPrismaError(e, "Equipment with this code already exists in your organization");
     }
-  });
+  }, "equipment.manage");
 }

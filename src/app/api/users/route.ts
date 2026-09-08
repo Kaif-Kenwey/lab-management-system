@@ -1,90 +1,73 @@
 import { NextRequest } from "next/server";
+import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody, mapPrismaError } from "@/lib/validation";
 import { hashPassword } from "@/lib/auth";
 import { ROLES } from "@/lib/constants";
 
+// Explicit select — NEVER expose passwordHash
+const userSelect = {
+  id: true,
+  name: true,
+  email: true,
+  role: true,
+  department: true,
+  status: true,
+  phone: true,
+  createdAt: true,
+} satisfies Prisma.UserSelect;
+
+export const createUserSchema = z.object({
+  name: z.string().trim().min(1, "Name is required").max(120),
+  email: z.string().trim().toLowerCase().email("A valid email is required"),
+  password: z.string().min(8, "Password must be at least 8 characters").max(200),
+  role: z.enum(ROLES).optional().default("STUDENT"),
+  department: z.string().trim().max(120).nullish(),
+});
+
 export async function GET(req: NextRequest) {
-  return withAuth(async (session) => {
-    const q = req.nextUrl.searchParams.get("q")?.trim() ?? "";
-    const where: Prisma.UserWhereInput = {
-      organizationId: session.orgId,
-      ...(q
-        ? { OR: [{ name: { contains: q } }, { email: { contains: q } }, { department: { contains: q } }] }
-        : {}),
-    };
+  return withAuth(req, async (ctx) => {
+    const q = ctx.searchParams.get("q")?.trim() ?? "";
     const users = await db.user.findMany({
-      where,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        department: true,
-        status: true,
-        createdAt: true,
+      where: {
+        organizationId: ctx.session.orgId,
+        ...(q
+          ? { OR: [{ name: { contains: q } }, { email: { contains: q } }, { department: { contains: q } }] }
+          : {}),
       },
+      select: userSelect,
       orderBy: { createdAt: "asc" },
     });
     return ok(users);
-  }, ["ADMIN", "LAB_MANAGER"]);
+  }, "users.manage");
 }
 
 export async function POST(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{
-      name?: string;
-      email?: string;
-      password?: string;
-      role?: string;
-      department?: string;
-    }>(req);
-
-    if (!b.name?.trim() || !b.email?.trim() || !b.password) {
-      return fail("Name, email and password are required");
-    }
-    if (b.password.length < 8) return fail("Password must be at least 8 characters");
-    if (b.role && !(ROLES as readonly string[]).includes(b.role)) {
-      return fail(`Invalid role — must be one of: ${ROLES.join(", ")}`);
-    }
-
-    const email = b.email.toLowerCase().trim();
-    const existing = await db.user.findUnique({ where: { email } });
-    if (existing) return fail("A user with this email already exists", 409);
-
-    const passwordHash = await hashPassword(b.password);
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, createUserSchema);
+    const passwordHash = await hashPassword(data.password);
 
     try {
       const user = await db.user.create({
         data: {
-          organizationId: session.orgId,
-          name: b.name.trim(),
-          email,
+          organizationId: ctx.session.orgId,
+          name: data.name,
+          email: data.email,
           passwordHash,
-          role: b.role ?? "STUDENT",
-          department: b.department ?? null,
+          role: data.role,
+          department: data.department ?? null,
         },
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          department: true,
-          status: true,
-          createdAt: true,
-        },
+        select: userSelect,
       });
-      await audit(session.orgId, session.userId, "USER_CREATED", "User", user.id, {
+      await audit(ctx.session.orgId, ctx.session.userId, "USER_CREATED", "User", user.id, {
         name: user.name,
         role: user.role,
       });
       return ok(user, 201);
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        return fail("A user with this email already exists", 409);
-      }
-      throw e;
+      mapPrismaError(e, "A user with this email already exists");
     }
-  }, ["ADMIN"]);
+  }, "users.manage");
 }

@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import {
   QueryClient,
   QueryClientProvider,
@@ -17,6 +19,8 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
+import { can } from "@/lib/permissions";
+import { apiFetch, apiJson } from "@/lib/client";
 import { EQUIPMENT_CONDITION } from "@/lib/constants";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -49,6 +53,7 @@ type CheckoutRow = {
   status: string;
   conditionOut?: string | null;
   conditionIn?: string | null;
+  accessoriesIn?: string | null;
   notes?: string | null;
   equipment?: { name?: string; code?: string } | null;
   user?: { name?: string } | null;
@@ -57,14 +62,10 @@ type CheckoutRow = {
 type EquipmentOption = { id: string; name: string; code: string; status: string };
 type UserOption = { id: string; name: string; email: string; status: string };
 
-async function fetcher(url: string) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    const d = await res.json().catch(() => ({}));
-    throw new Error(d.error || "Request failed");
-  }
-  return res.json();
-}
+type Me = {
+  session: { userId: string; role: string; name: string };
+  permissions?: string[];
+};
 
 function fmt(v?: string | null) {
   if (!v) return "—";
@@ -94,69 +95,85 @@ export default function CheckoutsPage() {
   const [queryClient] = useState(() => new QueryClient());
   return (
     <QueryClientProvider client={queryClient}>
-      <CheckoutsContent />
+      <Suspense
+        fallback={
+          <div className="space-y-6">
+            <Skeleton className="h-9 w-64" />
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Skeleton className="h-28 rounded-xl" />
+              <Skeleton className="h-28 rounded-xl" />
+              <Skeleton className="h-28 rounded-xl" />
+            </div>
+            <Skeleton className="h-72 rounded-xl" />
+          </div>
+        }
+      >
+        <CheckoutsContent />
+      </Suspense>
     </QueryClientProvider>
   );
 }
 
 function CheckoutsContent() {
   const queryClient = useQueryClient();
+  const searchParams = useSearchParams();
+  const equipmentParam = searchParams.get("equipment") ?? "";
+  const statusParam = searchParams.get("status") ?? "";
+
   const [createOpen, setCreateOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [checkinRow, setCheckinRow] = useState<CheckoutRow | null>(null);
   const [conditionIn, setConditionIn] = useState("");
+  const [accessoriesIn, setAccessoriesIn] = useState("");
+
+  const me = useQuery<Me>({ queryKey: ["me"], queryFn: () => apiFetch<Me>("/api/auth/me") });
 
   const checkouts = useQuery<CheckoutRow[]>({
     queryKey: ["checkouts"],
-    queryFn: () => fetcher("/api/checkouts"),
+    queryFn: () => apiFetch<CheckoutRow[]>("/api/checkouts"),
   });
 
   const availableEquipment = useQuery<EquipmentOption[]>({
     queryKey: ["equipment", { status: "AVAILABLE" }],
-    queryFn: () => fetcher("/api/equipment?status=AVAILABLE"),
+    queryFn: () => apiFetch<EquipmentOption[]>("/api/equipment?status=AVAILABLE"),
     enabled: createOpen,
   });
 
   const users = useQuery<UserOption[]>({
     queryKey: ["users"],
-    queryFn: () => fetcher("/api/users"),
+    queryFn: () => apiFetch<UserOption[]>("/api/users"),
     enabled: createOpen,
   });
 
-  useEffect(() => {
-    if (checkouts.isError) {
-      toast({
-        title: "Failed to load checkouts",
-        description: checkouts.error instanceof Error ? checkouts.error.message : "Something went wrong",
-        variant: "destructive",
-      });
-    }
-  }, [checkouts.isError, checkouts.error]);
+  const role = me.data?.session?.role;
+  const myId = me.data?.session?.userId;
 
-  const rows = checkouts.data ?? [];
-  const overdueCount = rows.filter((r) => isOverdue(r) || r.status === "OVERDUE").length;
-  const activeCount = rows.filter((r) => r.status === "ACTIVE" && !isOverdue(r)).length;
-  const returnedCount = rows.filter((r) => r.status === "RETURNED").length;
+  // Check-in is for approver/field roles (equipment.manage) or the borrower.
+  const canCheckInRow = (row: CheckoutRow) =>
+    row.status === "ACTIVE" &&
+    (!!myId && (row.userId === myId || can(role ?? "", "equipment.manage")));
+
+  const rows = (checkouts.data ?? []).filter((r) => {
+    if (equipmentParam && r.equipmentId !== equipmentParam) return false;
+    if (statusParam === "OVERDUE") return isOverdue(r) || r.status === "OVERDUE";
+    if (statusParam === "ACTIVE") return r.status === "ACTIVE" && !isOverdue(r);
+    return true;
+  });
+
+  const allRows = checkouts.data ?? [];
+  const overdueCount = allRows.filter((r) => isOverdue(r) || r.status === "OVERDUE").length;
+  const activeCount = allRows.filter((r) => r.status === "ACTIVE" && !isOverdue(r)).length;
+  const returnedCount = allRows.filter((r) => r.status === "RETURNED").length;
 
   const createCheckout = useMutation({
-    mutationFn: async () => {
-      const res = await fetch("/api/checkouts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          equipmentId: form.equipmentId,
-          userId: form.userId,
-          dueAt: form.dueAt ? new Date(form.dueAt).toISOString() : "",
-          conditionOut: form.conditionOut,
-          notes: form.notes.trim() || null,
-        }),
-      });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Request failed");
-      }
-      return res.json();
-    },
+    mutationFn: async () =>
+      apiJson("/api/checkouts", "POST", {
+        equipmentId: form.equipmentId,
+        userId: form.userId,
+        dueAt: form.dueAt ? new Date(form.dueAt).toISOString() : "",
+        conditionOut: form.conditionOut,
+        notes: form.notes.trim() || null,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["checkouts"] });
       queryClient.invalidateQueries({ queryKey: ["equipment"] });
@@ -171,16 +188,11 @@ function CheckoutsContent() {
   const checkin = useMutation({
     mutationFn: async () => {
       if (!checkinRow) return null;
-      const res = await fetch(`/api/checkouts/${checkinRow.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ checkedIn: true, conditionIn }),
+      return apiJson(`/api/checkouts/${checkinRow.id}`, "PATCH", {
+        checkedIn: true,
+        conditionIn,
+        accessoriesIn: accessoriesIn.trim() || null,
       });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Request failed");
-      }
-      return res.json();
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["checkouts"] });
@@ -188,6 +200,7 @@ function CheckoutsContent() {
       toast({ title: "Equipment checked in" });
       setCheckinRow(null);
       setConditionIn("");
+      setAccessoriesIn("");
     },
     onError: (e: Error) =>
       toast({ title: "Check-in failed", description: e.message, variant: "destructive" }),
@@ -215,9 +228,26 @@ function CheckoutsContent() {
 
       <div className="grid gap-4 sm:grid-cols-3">
         <StatCard title="Active" value={activeCount} icon={PackageOpen} hint="Currently issued" />
-        <StatCard title="Overdue" value={overdueCount} icon={TriangleAlert} hint="Past due date" />
+        <Link href="/checkouts?status=OVERDUE" className="group block">
+          <StatCard
+            title="Overdue"
+            value={overdueCount}
+            icon={TriangleAlert}
+            hint={overdueCount > 0 ? "View overdue list" : "None past due"}
+            className="transition-colors group-hover:border-red-300 dark:group-hover:border-red-800"
+          />
+        </Link>
         <StatCard title="Returned" value={returnedCount} icon={CheckCircle2} hint="Checked in" />
       </div>
+
+      {statusParam ? (
+        <p className="text-sm text-muted-foreground">
+          Filtered to <span className="font-medium text-foreground">{humanize(statusParam)}</span>.{" "}
+          <a href="/checkouts" className="underline underline-offset-2 hover:text-foreground">
+            Clear filter
+          </a>
+        </p>
+      ) : null}
 
       <Card>
         <CardContent className="p-0">
@@ -227,17 +257,38 @@ function CheckoutsContent() {
                 <Skeleton key={i} className="h-12 w-full" />
               ))}
             </div>
+          ) : checkouts.isError ? (
+            <div className="p-6">
+              <EmptyState
+                icon={ArrowLeftRight}
+                title="Failed to load checkouts"
+                description={
+                  checkouts.error instanceof Error ? checkouts.error.message : "Something went wrong"
+                }
+                action={
+                  <Button variant="outline" onClick={() => checkouts.refetch()} disabled={checkouts.isRefetching}>
+                    Try again
+                  </Button>
+                }
+              />
+            </div>
           ) : rows.length === 0 ? (
             <div className="p-6">
               <EmptyState
                 icon={ArrowLeftRight}
                 title="No checkouts"
-                description="When equipment is issued to a user it will appear here."
+                description={
+                  statusParam || equipmentParam
+                    ? "No checkouts match the current filter."
+                    : "When equipment is issued to a user it will appear here."
+                }
                 action={
-                  <Button variant="outline" onClick={() => setCreateOpen(true)}>
-                    <ArrowLeftRight className="h-4 w-4 mr-1.5" aria-hidden="true" />
-                    New Checkout
-                  </Button>
+                  !statusParam && !equipmentParam ? (
+                    <Button variant="outline" onClick={() => setCreateOpen(true)}>
+                      <ArrowLeftRight className="h-4 w-4 mr-1.5" aria-hidden="true" />
+                      New Checkout
+                    </Button>
+                  ) : undefined
                 }
               />
             </div>
@@ -258,10 +309,16 @@ function CheckoutsContent() {
                 <TableBody>
                   {rows.map((row) => {
                     const overdue = isOverdue(row) || row.status === "OVERDUE";
+                    const canCheckIn = canCheckInRow(row);
                     return (
-                      <TableRow key={row.id}>
+                      <TableRow key={row.id} className={overdue ? "bg-red-50/60 dark:bg-red-950/30" : undefined}>
                         <TableCell>
-                          <div className="font-medium">{row.equipment?.name || "—"}</div>
+                          <Link
+                            href={`/equipment/${row.equipmentId}`}
+                            className="font-medium hover:underline"
+                          >
+                            {row.equipment?.name || "—"}
+                          </Link>
                           {row.equipment?.code ? (
                             <div className="text-xs font-mono text-muted-foreground">{row.equipment.code}</div>
                           ) : null}
@@ -293,7 +350,7 @@ function CheckoutsContent() {
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center justify-end">
-                            {row.status === "ACTIVE" ? (
+                            {canCheckIn ? (
                               <Button
                                 size="sm"
                                 variant="outline"
@@ -301,6 +358,7 @@ function CheckoutsContent() {
                                 disabled={checkin.isPending}
                                 onClick={() => {
                                   setConditionIn("");
+                                  setAccessoriesIn("");
                                   setCheckinRow(row);
                                 }}
                               >
@@ -419,6 +477,7 @@ function CheckoutsContent() {
           if (!o) {
             setCheckinRow(null);
             setConditionIn("");
+            setAccessoriesIn("");
           }
         }}
       >
@@ -429,20 +488,34 @@ function CheckoutsContent() {
               {checkinRow?.equipment?.name ? `${checkinRow.equipment.name} — returned condition.` : "Returned condition."}
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-2">
-            <Label>Condition in</Label>
-            <Select value={conditionIn} onValueChange={setConditionIn}>
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Select condition" />
-              </SelectTrigger>
-              <SelectContent>
-                {EQUIPMENT_CONDITION.map((c) => (
-                  <SelectItem key={c} value={c}>
-                    {humanize(c)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <Label>Condition in</Label>
+              <Select value={conditionIn} onValueChange={setConditionIn}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select condition" />
+                </SelectTrigger>
+                <SelectContent>
+                  {EQUIPMENT_CONDITION.map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {humanize(c)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="ci-accessories">Accessories returned</Label>
+              <Input
+                id="ci-accessories"
+                placeholder="Power cable, probes, carry case..."
+                value={accessoriesIn}
+                onChange={(e) => setAccessoriesIn(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                List the accessories returned with the equipment, if any.
+              </p>
+            </div>
             {checkinRow?.notes ? (
               <p className="text-xs text-muted-foreground">Notes: {checkinRow.notes}</p>
             ) : null}
@@ -453,6 +526,7 @@ function CheckoutsContent() {
               onClick={() => {
                 setCheckinRow(null);
                 setConditionIn("");
+                setAccessoriesIn("");
               }}
               disabled={checkin.isPending}
             >

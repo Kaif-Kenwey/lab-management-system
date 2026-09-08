@@ -1,92 +1,100 @@
 import { NextRequest } from "next/server";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody, mapPrismaError, optionalId } from "@/lib/validation";
+import { EXPERIMENT_STATUS } from "@/lib/constants";
+import { NotFoundError, ConflictError } from "@/lib/errors";
 
-const EXPERIMENT_STATUSES = ["DRAFT", "ACTIVE", "ARCHIVED"];
+const updateExperimentSchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  code: z.string().trim().min(1).max(40).optional(),
+  labId: z.string().min(1).optional(),
+  courseId: optionalId,
+  instructorId: optionalId,
+  description: z.string().max(1000).nullish(),
+  status: z.enum(EXPERIMENT_STATUS).optional(),
+});
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{
-      title?: string;
-      code?: string;
-      labId?: string;
-      description?: string | null;
-      instructorId?: string | null;
-      status?: string;
-    }>(req);
-
-    if (b.status && !EXPERIMENT_STATUSES.includes(b.status)) {
-      return fail(`Invalid status — must be one of: ${EXPERIMENT_STATUSES.join(", ")}`);
-    }
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, updateExperimentSchema);
 
     const experiment = await db.experiment.findFirst({
-      where: { id, organizationId: session.orgId },
+      where: { id, organizationId: ctx.session.orgId },
+      select: { id: true, title: true },
     });
-    if (!experiment) return fail("Experiment not found", 404);
+    if (!experiment) throw NotFoundError("Experiment not found");
 
-    if (b.labId) {
-      const lab = await db.lab.findFirst({ where: { id: b.labId, organizationId: session.orgId } });
-      if (!lab) return fail("Lab not found in your organization", 404);
-    }
-    if (b.instructorId) {
-      const instructor = await db.user.findFirst({
-        where: { id: b.instructorId, organizationId: session.orgId },
+    if (data.labId) {
+      const lab = await db.lab.findFirst({
+        where: { id: data.labId, organizationId: ctx.session.orgId },
+        select: { id: true },
       });
-      if (!instructor) return fail("Instructor not found in your organization", 404);
+      if (!lab) throw NotFoundError("Lab not found in your organization");
     }
-
-    const data: Prisma.ExperimentUncheckedUpdateInput = {};
-    if (b.title !== undefined) data.title = b.title.trim();
-    if (b.code !== undefined) data.code = b.code.trim();
-    if (b.labId !== undefined) data.labId = b.labId;
-    if (b.description !== undefined) data.description = b.description;
-    if (b.instructorId !== undefined) data.instructorId = b.instructorId;
-    if (b.status !== undefined) data.status = b.status;
+    if (data.courseId) {
+      const course = await db.course.findFirst({
+        where: { id: data.courseId, organizationId: ctx.session.orgId },
+        select: { id: true },
+      });
+      if (!course) throw NotFoundError("Course not found in your organization");
+    }
+    if (data.instructorId) {
+      const instructor = await db.user.findFirst({
+        where: { id: data.instructorId, organizationId: ctx.session.orgId },
+        select: { id: true },
+      });
+      if (!instructor) throw NotFoundError("Instructor not found in your organization");
+    }
 
     try {
       const updated = await db.experiment.update({
         where: { id },
-        data,
+        data: {
+          ...(data.title !== undefined ? { title: data.title } : {}),
+          ...(data.code !== undefined ? { code: data.code } : {}),
+          ...(data.labId !== undefined ? { labId: data.labId } : {}),
+          ...(data.courseId !== undefined ? { courseId: data.courseId ?? null } : {}),
+          ...(data.instructorId !== undefined ? { instructorId: data.instructorId ?? null } : {}),
+          ...(data.description !== undefined ? { description: data.description ?? null } : {}),
+          ...(data.status !== undefined ? { status: data.status } : {}),
+        },
         include: {
+          course: { select: { id: true, title: true, code: true } },
           lab: { select: { id: true, name: true, code: true } },
-          instructor: { select: { id: true, name: true } },
+          instructor: { select: { id: true, name: true, email: true } },
           _count: { select: { sessions: true } },
         },
       });
-      await audit(session.orgId, session.userId, "EXPERIMENT_UPDATED", "Experiment", id, {
+      await audit(ctx.session.orgId, ctx.session.userId, "EXPERIMENT_UPDATED", "Experiment", id, {
         title: updated.title,
       });
       return ok(updated);
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        return fail("An experiment with this code already exists in your organization", 409);
-      }
-      throw e;
+      mapPrismaError(e, "An experiment with this code already exists in your organization");
     }
-  }, ["ADMIN", "LAB_MANAGER", "INSTRUCTOR"]);
+  }, "academics.manage");
 }
 
-export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
+  return withAuth(req, async (ctx) => {
     const experiment = await db.experiment.findFirst({
-      where: { id, organizationId: session.orgId },
+      where: { id, organizationId: ctx.session.orgId },
+      select: { id: true, title: true, _count: { select: { sessions: true } } },
     });
-    if (!experiment) return fail("Experiment not found", 404);
+    if (!experiment) throw NotFoundError("Experiment not found");
 
-    try {
-      await db.experiment.delete({ where: { id } });
-      await audit(session.orgId, session.userId, "EXPERIMENT_DELETED", "Experiment", id, {
-        title: experiment.title,
-      });
-      return ok({ success: true });
-    } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2003") {
-        return fail("This experiment has sessions and cannot be deleted", 409);
-      }
-      throw e;
+    if (experiment._count.sessions > 0) {
+      throw ConflictError("Experiment has sessions and cannot be deleted");
     }
-  }, ["ADMIN", "LAB_MANAGER", "INSTRUCTOR"]);
+
+    await db.experiment.delete({ where: { id } });
+    await audit(ctx.session.orgId, ctx.session.userId, "EXPERIMENT_DELETED", "Experiment", id, {
+      title: experiment.title,
+    });
+    return ok({ success: true });
+  }, "academics.manage");
 }

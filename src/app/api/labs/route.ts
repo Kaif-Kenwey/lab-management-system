@@ -1,79 +1,82 @@
 import { NextRequest } from "next/server";
+import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody, mapPrismaError, optionalId } from "@/lib/validation";
+import { NotFoundError } from "@/lib/errors";
+
+const labInclude = {
+  department: { select: { id: true, name: true, code: true } },
+  manager: { select: { id: true, name: true, email: true } },
+  _count: { select: { equipment: true } },
+} satisfies Prisma.LabInclude;
+
+export const createLabSchema = z.object({
+  name: z.string().trim().min(1, "Lab name is required").max(120),
+  code: z.string().trim().min(1, "Lab code is required").max(40),
+  location: z.string().trim().max(200).nullish(),
+  capacity: z.coerce.number().int("Capacity must be a whole number").min(0).optional().default(0),
+  description: z.string().max(1000).nullish(),
+  managerId: optionalId,
+  departmentId: optionalId,
+});
 
 export async function GET(req: NextRequest) {
-  return withAuth(async (session) => {
-    const q = req.nextUrl.searchParams.get("q")?.trim() ?? "";
-    const where: Prisma.LabWhereInput = {
-      organizationId: session.orgId,
-      ...(q ? { OR: [{ name: { contains: q } }, { code: { contains: q } }] } : {}),
-    };
+  return withAuth(req, async (ctx) => {
+    const q = ctx.searchParams.get("q")?.trim() ?? "";
     const labs = await db.lab.findMany({
-      where,
-      include: {
-        manager: { select: { id: true, name: true, email: true } },
-        _count: { select: { equipment: true } },
+      where: {
+        organizationId: ctx.session.orgId,
+        ...(q ? { OR: [{ name: { contains: q } }, { code: { contains: q } }] } : {}),
       },
+      include: labInclude,
       orderBy: { createdAt: "asc" },
     });
     return ok(labs);
-  });
+  }, "labs.read");
 }
 
 export async function POST(req: NextRequest) {
-  return withAuth(async (session) => {
-    const b = await body<{
-      name?: string;
-      code?: string;
-      location?: string;
-      capacity?: number | string;
-      description?: string;
-      managerId?: string;
-    }>(req);
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, createLabSchema);
 
-    if (!b.name?.trim() || !b.code?.trim()) return fail("Lab name and code are required");
-
-    const capacity =
-      b.capacity === undefined || b.capacity === null || b.capacity === ""
-        ? 0
-        : Number(b.capacity);
-    if (Number.isNaN(capacity) || capacity < 0) return fail("Capacity must be a non-negative number");
-
-    if (b.managerId) {
+    if (data.managerId) {
       const manager = await db.user.findFirst({
-        where: { id: b.managerId, organizationId: session.orgId },
+        where: { id: data.managerId, organizationId: ctx.session.orgId },
+        select: { id: true },
       });
-      if (!manager) return fail("Manager not found in your organization", 404);
+      if (!manager) throw NotFoundError("Manager not found in your organization");
+    }
+    if (data.departmentId) {
+      const department = await db.department.findFirst({
+        where: { id: data.departmentId, organizationId: ctx.session.orgId },
+        select: { id: true },
+      });
+      if (!department) throw NotFoundError("Department not found in your organization");
     }
 
     try {
       const lab = await db.lab.create({
         data: {
-          organizationId: session.orgId,
-          name: b.name.trim(),
-          code: b.code.trim(),
-          location: b.location ?? null,
-          capacity,
-          description: b.description ?? null,
-          managerId: b.managerId ?? null,
+          organizationId: ctx.session.orgId,
+          name: data.name,
+          code: data.code,
+          location: data.location ?? null,
+          capacity: data.capacity,
+          description: data.description ?? null,
+          managerId: data.managerId ?? null,
+          departmentId: data.departmentId ?? null,
         },
-        include: {
-          manager: { select: { id: true, name: true, email: true } },
-          _count: { select: { equipment: true } },
-        },
+        include: labInclude,
       });
-      await audit(session.orgId, session.userId, "LAB_CREATED", "Lab", lab.id, {
+      await audit(ctx.session.orgId, ctx.session.userId, "LAB_CREATED", "Lab", lab.id, {
         name: lab.name,
         code: lab.code,
       });
       return ok(lab, 201);
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        return fail("A lab with this code already exists in your organization", 409);
-      }
-      throw e;
+      mapPrismaError(e, "A lab with this code already exists in your organization");
     }
-  }, ["ADMIN", "LAB_MANAGER"]);
+  }, "labs.manage");
 }

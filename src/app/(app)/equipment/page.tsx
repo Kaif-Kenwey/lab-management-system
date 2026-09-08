@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import {
   QueryClient,
   QueryClientProvider,
@@ -68,7 +69,7 @@ async function fetcher(url: string) {
   const res = await fetch(url);
   if (!res.ok) {
     const d = await res.json().catch(() => ({}));
-    throw new Error(d.error || "Request failed");
+    throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Request failed");
   }
   return res.json();
 }
@@ -123,6 +124,7 @@ function EquipmentContent() {
   const [form, setForm] = useState(emptyForm);
   const [qrRow, setQrRow] = useState<EquipmentRow | null>(null);
   const [qrUrl, setQrUrl] = useState<string | null>(null);
+  const [qrScanUrl, setQrScanUrl] = useState("");
 
   useEffect(() => {
     const t = setTimeout(() => setQ(search), 300);
@@ -159,10 +161,14 @@ function EquipmentContent() {
 
   useEffect(() => {
     if (!qrRow) return;
+    const scanUrl = `${window.location.origin}/scan/${qrRow.qrToken}`;
     let cancelled = false;
-    QRCode.toDataURL(`LABVAULT:${qrRow.qrToken}`)
+    QRCode.toDataURL(scanUrl)
       .then((url) => {
-        if (!cancelled) setQrUrl(url);
+        if (!cancelled) {
+          setQrScanUrl(scanUrl);
+          setQrUrl(url);
+        }
       })
       .catch(() => {
         if (!cancelled) setQrUrl(null);
@@ -216,7 +222,7 @@ function EquipmentContent() {
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Request failed");
+        throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Request failed");
       }
       return res.json();
     },
@@ -236,7 +242,7 @@ function EquipmentContent() {
       const res = await fetch(`/api/equipment/${id}`, { method: "DELETE" });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || "Request failed");
+        throw new Error(typeof d.error === "string" ? d.error : d?.error?.message || "Request failed");
       }
       return res.json();
     },
@@ -586,16 +592,24 @@ function EquipmentContent() {
             <div className="text-center">
               <div className="font-semibold">{qrRow?.name}</div>
               <div className="text-sm font-mono text-muted-foreground">{qrRow?.code}</div>
+              {qrScanUrl ? (
+                <div className="mt-1 text-xs break-all text-muted-foreground">{qrScanUrl}</div>
+              ) : null}
             </div>
             <p className="text-xs text-center text-muted-foreground">
-              Print this QR code and affix it to the equipment body for quick identification and scan-based
-              tracking.
+              Print this QR code and affix it to the equipment body. Scanning it opens the equipment
+              page in LabVault for identification and scan-based tracking.
             </p>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => window.print()}>
               Print
             </Button>
+            {qrRow ? (
+              <Button asChild variant="outline">
+                <Link href={`/equipment/${qrRow.id}`}>Open equipment page</Link>
+              </Button>
+            ) : null}
             <Button variant="outline" onClick={() => { setQrRow(null); setQrUrl(null); }}>
               Close
             </Button>

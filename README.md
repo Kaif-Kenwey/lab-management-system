@@ -1,133 +1,135 @@
-# LabVault — Lab Management System
+# LabVault — Laboratory Operations & Management Platform
 
-A production-grade, **multi-tenant laboratory management platform** built with a modern, in-demand stack. LabVault unifies equipment lifecycle, reservations, inventory, chemical safety, maintenance scheduling, academic sessions, incident reporting and procurement behind role-based access control (RBAC) and a complete audit trail.
+A production-grade, **multi-tenant SaaS platform** for running institutional laboratories: equipment lifecycle with QR asset tags, a double-entry-style inventory ledger, conflict-aware reservations, maintenance work orders, calibration compliance, academic practical sessions, safety/incident management and a full procurement cycle (request → approval → purchase order → goods receipt → stock) — behind role-based access control with granular permissions and a complete audit trail.
+
+[![CI](https://github.com/Kaif-Kenwey/lab-management-system/actions/workflows/ci.yml/badge.svg)](https://github.com/Kaif-Kenwey/lab-management-system/actions/workflows/ci.yml)
 
 > **Demo logins** (password for all: `Password@123`)
-> `admin@labvault.io` (Admin) · `manager@labvault.io` (Lab Manager) · `instructor@labvault.io` (Instructor) · `tech@labvault.io` (Technician) · `student@labvault.io` (Student)
+> `admin@labvault.io` · `manager@labvault.io` · `instructor@labvault.io` · `tech@labvault.io` · `student@labvault.io`
 
 ---
 
-## ✨ Features
+## Highlights
 
-### Modules (14)
-| Module | Capabilities |
-|---|---|
-| **Dashboard** | Live KPIs, equipment-by-category chart, lab utilization chart, overdue & low-stock alerts, upcoming sessions, recent activity feed |
-| **Labs** | CRUD, capacity/status/manager, per-lab detail with equipment, inventory and session tabs |
-| **Equipment** | Full lifecycle (AVAILABLE → IN_USE → UNDER_MAINTENANCE → RETIRED), condition tracking, valuation, **QR code labels** (print-ready) |
-| **Reservations** | Conflict-aware booking (server-side overlap detection → 409), approval workflow (PENDING → APPROVED/REJECTED/CANCELLED/COMPLETED) |
-| **Checkouts** | Check-out / check-in workflow, due dates, overdue detection, condition capture |
-| **Inventory** | Stock levels, minimum thresholds, low-stock warnings, ± quantity adjustments |
-| **Chemicals** | CAS registry numbers, hazard classes (flammable/corrosive/toxic/reactive), expiry monitoring |
-| **Maintenance** | Preventive / corrective / calibration jobs with equipment status sync (IN_PROGRESS → equipment UNDER_MAINTENANCE; COMPLETED → AVAILABLE) |
-| **Academics** | Experiments, lab sessions, attendance marking (bulk replace-all semantics) |
-| **Incidents** | Severity-tagged safety reports (LOW → CRITICAL) with OPEN → INVESTIGATING → RESOLVED flow |
-| **Procurement** | Vendor directory + purchase requests with role-gated approvals (SUBMITTED → APPROVED → ORDERED → RECEIVED) |
-| **Reports** | Utilization and inventory-health analytics |
-| **Audit Log** | Immutable trail of every consequential action, searchable (Admin/Manager only) |
-| **Settings** | Profile & organization overview |
+- **Operations Center** — an action-first dashboard: *"what needs attention right now?"* Overdue checkouts, calibration compliance, low stock, critical incidents and pending approvals as clickable cards that deep-link into filtered views.
+- **Inventory Ledger** — stock never changes silently. Every RECEIPT / ISSUE / RETURN / TRANSFER / ADJUSTMENT / DAMAGE / EXPIRY is a transactional ledger row with `previousBalance → newBalance`, actor, reason and low-stock notifications. Reorder suggestions included.
+- **Asset lifecycle** — every equipment status change writes an immutable event; the detail page renders a full timeline (created, reserved, checked out, returned, maintenance, calibration, retired) plus documents, reservations, checkouts and calibration records per asset.
+- **QR workflow** — every asset carries a scannable QR that resolves to `/scan/{token}` → authenticated, tenant-checked equipment page with quick actions.
+- **Procurement cycle** — Purchase Requests → approvals → Purchase Orders → Send → partial/full Goods Receipt → automatic stock ledger entries → vendor + spend tracking.
+- **Work orders & calibration** — OPEN → ASSIGNED → IN_PROGRESS → WAITING_FOR_PARTS → COMPLETED with equipment status sync, downtime hours and labor/parts cost rollup; calibration records with automatic VALID / DUE_SOON / OVERDUE / FAILED status and a compliance KPI.
+- **Academics** — departments, courses, experiments, practical sessions, bulk attendance and per-session grading.
+- **AI Lab Assistant** — permission-scoped operational Q&A. The server builds a role-appropriate data digest (never the raw database), asks the LLM, and returns the answer with source links and an "AI-generated insight" disclaimer.
+- **Global search (⌘K)** — grouped results across labs, equipment, inventory, reservations, incidents, maintenance and experiments.
+- **Platform** — multi-tenancy, RBAC (5 roles × 31 permissions), immutable-style audit trail with request IDs, notifications with deep links, health/readiness endpoints, structured JSON logs.
 
-### Platform
-- 🔐 **Authentication** — email/password with bcrypt hashing, JWT sessions (jose, HS256) in httpOnly cookies, 7-day expiry
-- 👥 **RBAC** — 5 roles (ADMIN, LAB_MANAGER, INSTRUCTOR, TECHNICIAN, STUDENT) enforced **server-side** on every endpoint via a `withAuth(handler, roles)` guard
-- 🏢 **Multi-tenant** — every record is scoped by `organizationId`; users sign up to their own isolated workspace
-- 📱 **Responsive** — mobile-first UI with collapsible sidebar, dark mode support
-- 🧾 **Audit trail** — mutations write structured audit entries (actor, action, entity, metadata)
-- 🌱 **Seed data** — realistic demo institution: 4 labs, 14 equipment items, chemicals, maintenance jobs, sessions, incidents, vendors
+## Architecture
 
----
+```
+┌────────────────────────────────────────────────────────┐
+│                   Browser (React 19)                   │
+│  App Router · shadcn/ui · TanStack Query · Recharts    │
+└──────────────▲───────────────────────▲─────────────────┘
+               │ RSC                   │ fetch /api
+┌──────────────┴───────────────────────┴─────────────────┐
+│                   Next.js 16 (Node)                    │
+│  Pages (RSC)          REST route handlers              │
+│                         │                              │
+│            withAuth: session → permission →            │
+│            requestId → zod → transaction → audit       │
+│                         │                              │
+│   lib: ledger · business-rules · lifecycle · notify    │
+│                         │                              │
+│              Prisma ORM (org-scoped queries)           │
+└─────────────────┬──────────────────────┬───────────────┘
+                  │                      │
+           SQLite (local/demo)     PostgreSQL (prod)
+```
 
-## 🛠 Tech Stack
+## Tech stack
 
 | Layer | Technology |
 |---|---|
-| Framework | **Next.js 16** (App Router, React 19, Server Components) |
-| Language | **TypeScript 5** (strict) |
-| Database | **SQLite** + **Prisma ORM** (16 models) |
-| Styling | **Tailwind CSS 4** + **shadcn/ui** (New York) + Lucide icons |
-| State | **TanStack Query v5** (server state), Zustand-ready |
-| Auth | **jose** (JWT) + **bcryptjs**, httpOnly cookie sessions |
-| Charts | **Recharts** |
-| QR codes | **qrcode** |
+| Framework | **Next.js 16** (App Router, RSC, Turbopack), **React 19**, **TypeScript 5** (strict) |
+| Database | **Prisma ORM** — SQLite (local/CI) · **PostgreSQL 16** (production profile) |
+| UI | **Tailwind CSS 4** · **shadcn/ui** (New York) · Lucide · Recharts · next-themes (dark mode) |
+| State/data | **TanStack Query v5** |
+| Auth | **jose** (JWT HS256, httpOnly cookies) + **bcryptjs** |
+| Validation | **Zod** on every mutating endpoint |
+| AI | z-ai-web-dev-sdk LLM with permission-scoped context |
+| Quality | **ESLint** · **Vitest** (unit + integration) · **Playwright** (E2E) · **GitHub Actions CI** |
+| Ops | Docker multi-stage image · docker-compose (app + Postgres) · health/readiness endpoints |
 
----
+## Security architecture
 
-## 🚀 Getting Started
+- **AuthN** — bcrypt (cost 10), JWT in httpOnly cookies (SameSite-aware for iframe deployments), 7-day expiry, login rate limiting, generic auth errors (no user enumeration).
+- **AuthZ** — 31 granular permissions across 5 roles enforced **server-side** on every endpoint; the UI merely mirrors them.
+- **Tenancy** — every record carries `organizationId` derived from the session; cross-tenant ids return **404** (no existence leaks); covered by dedicated tests.
+- **Integrity** — DB transactions for all multi-step workflows; append-only inventory ledger and equipment lifecycle; explicit state machines for reservations, work orders and incidents.
+- **Input** — Zod schemas; typed error envelope `{error:{code,message,requestId}}`; security headers; upload allowlist with magic-byte checks and size caps.
+- Details: [`docs/security.md`](docs/security.md) · [`docs/permissions.md`](docs/permissions.md)
+
+## Quickstart (local, SQLite)
 
 ```bash
-# 1. Install dependencies
-bun install        # or: npm install
-
-# 2. Configure environment
+bun install                      # or npm install
 cp .env.example .env
-
-# 3. Create the database schema
 bunx prisma db push
-
-# 4. Seed demo data
-bun prisma/seed.ts
-
-# 5. Run
-bun run dev        # http://localhost:3000
+bun prisma/seed.ts               # realistic demo org (idempotent)
+bun run dev                      # http://localhost:3000
 ```
 
-### Environment variables (`.env`)
-```env
-DATABASE_URL="file:./db/custom.db"
-JWT_SECRET="change-me-in-production"
+## Docker (PostgreSQL, one command)
+
+```bash
+docker compose up --build        # app :3000 + postgres:16 with persistent volume
 ```
 
----
+## Testing
 
-## 📐 Architecture
+```bash
+bun run test            # 70 tests: unit (37) + integration (33)
+bunx playwright test    # 6 browser E2E tests
+bun run lint && bun run typecheck
+```
+
+Integration tests boot a dedicated server (port 3100) against a seeded test DB; E2E uses port 3200. CI runs all of it plus a production build — see [`docs/testing.md`](docs/testing.md).
+
+## Project structure
 
 ```
 src/
 ├── app/
-│   ├── (auth)/            # Login / Register (split-screen brand layout)
-│   ├── (app)/             # Authenticated shell (sidebar + topbar) — 14 module pages
-│   ├── api/               # REST API — 30 route files, all withAuth-guarded & org-scoped
-│   │   ├── auth/          # signup, login, logout, me
-│   │   ├── labs/ equipment/ reservations/ checkouts/
-│   │   ├── inventory/ chemicals/ maintenance/
-│   │   ├── experiments/ sessions/ (incl. attendance)
-│   │   ├── incidents/ vendors/ purchases/ users/
-│   │   ├── dashboard/ audit/ notifications/
-│   └── page.tsx           # Public marketing landing
-├── components/
-│   ├── ui/                # shadcn/ui primitives
-│   ├── shared/            # PageHeader, StatCard, StatusBadge, EmptyState
-│   ├── app-sidebar.tsx    # Role-filtered navigation (14 items)
-│   ├── topbar.tsx         # Theme toggle, user menu, logout
-│   └── app-shell.tsx
-├── lib/
-│   ├── auth.ts            # JWT sign/verify, bcrypt, cookie session
-│   ├── api.ts             # withAuth guard, ok/fail/body, audit() helper
-│   ├── constants.ts       # Roles, statuses, categories (single source of truth)
-│   └── db.ts              # Prisma client singleton
-prisma/
-├── schema.prisma          # 16-model multi-tenant schema
-└── seed.ts                # Idempotent demo seed
+│   ├── (auth)/          # login / register (+ demo-mode password reset)
+│   ├── (app)/           # authenticated shell: 14 module pages
+│   ├── scan/[token]/    # QR → tenant-checked equipment redirect
+│   ├── api/             # REST handlers (auth, labs, equipment, reservations,
+│   │                    #   checkouts, inventory+ledger, chemicals, maintenance,
+│   │                    #   calibration, orders+receipts, academics, incidents,
+│   │                    #   documents, notifications, search, operations,
+│   │                    #   reports, assistant, audit, health)
+│   └── page.tsx         # public landing
+├── components/          # shadcn/ui + app shell + shared (badge, cards, timeline)
+├── lib/                 # auth, api (withAuth), permissions, ledger, business-rules,
+│                        #   lifecycle, notify, validation, rate-limit, errors, client
+prisma/                  # schema (28 models) + migrations + seed
+docs/                    # architecture, database, security, permissions, api, testing,
+                         #   deployment, audit-v2, API_CONTRACT
+tests/                   # unit · integration · e2e
 ```
 
-### API conventions
-- Every handler: `withAuth(async (session) => ok(data), roles?)` — auth, role guard, org scoping and error handling in one place
-- Errors: `{ error: string }` with proper status codes (400 validation, 401 unauthenticated, 403 forbidden, 404 missing, 409 conflict/duplicate)
-- Mutations write to the audit trail via `audit(orgId, userId, ACTION, EntityType, id, metadata)`
+## Documentation
 
-See [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) for the full endpoint reference.
+[`docs/architecture.md`](docs/architecture.md) · [`docs/database.md`](docs/database.md) · [`docs/security.md`](docs/security.md) · [`docs/permissions.md`](docs/permissions.md) · [`docs/api.md`](docs/api.md) · [`docs/testing.md`](docs/testing.md) · [`docs/deployment.md`](docs/deployment.md) · [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) · [`docs/audit-v2.md`](docs/audit-v2.md)
 
----
+## Roadmap
 
-## 🔒 Security notes
-- Passwords are never stored in plain text (bcrypt, cost 10)
-- Session JWTs are httpOnly + SameSite=Lax — not readable from client JS
-- All queries are organization-scoped server-side; the UI never trusts the client for authorization
-- Set a strong `JWT_SECRET` in production
+Email/Slack notification transports · S3-compatible document storage · OpenTelemetry tracing · JWT revocation store · 2FA · report exports to PDF · reservation calendar views.
 
-## 👥 Contributors
+## Contributors
+
 - **Kaif Kenwey** — [@Kaif-Kenwey](https://github.com/Kaif-Kenwey)
-- **Shyamali Samant** — [@ShyamaliSamant](https://github.com/ShyamaliSamant) (original repository)
+- **Shyamali Samant** — [@ShyamaliSamant](https://github.com/ShyamaliSamant) (original concept & early prototype)
 
-## 📄 License
+## License
+
 MIT — see [LICENSE](LICENSE)

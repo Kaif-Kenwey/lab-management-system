@@ -17,6 +17,7 @@ import {
   BarChart3,
   ScrollText,
   Settings,
+  Sparkles,
   FlaskConical as Logo,
 } from "lucide-react";
 import {
@@ -34,7 +35,7 @@ import {
 import { Role } from "@/lib/constants";
 
 const NAV: { title: string; url: string; icon: React.ElementType; roles?: Role[] }[] = [
-  { title: "Dashboard", url: "/dashboard", icon: LayoutDashboard },
+  { title: "Operations", url: "/dashboard", icon: LayoutDashboard },
   { title: "Labs", url: "/labs", icon: FlaskConical },
   { title: "Equipment", url: "/equipment", icon: Wrench },
   { title: "Reservations", url: "/reservations", icon: CalendarCheck },
@@ -46,6 +47,7 @@ const NAV: { title: string; url: string; icon: React.ElementType; roles?: Role[]
   { title: "Incidents", url: "/incidents", icon: AlertTriangle },
   { title: "Procurement", url: "/procurement", icon: ShoppingCart },
   { title: "Reports", url: "/reports", icon: BarChart3 },
+  { title: "Assistant", url: "/assistant", icon: Sparkles, roles: ["ADMIN", "LAB_MANAGER", "INSTRUCTOR", "TECHNICIAN"] },
   { title: "Audit Log", url: "/audit", icon: ScrollText, roles: ["ADMIN", "LAB_MANAGER"] },
   { title: "Settings", url: "/settings", icon: Settings },
 ];

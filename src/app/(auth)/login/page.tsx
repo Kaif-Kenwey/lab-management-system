@@ -7,7 +7,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Loader2, FlaskConical, ExternalLink, ShieldAlert } from "lucide-react";
+import { toast } from "@/hooks/use-toast";
 
 const BOUNCE_FLAG = "lms_login_bounce";
 
@@ -18,12 +27,27 @@ const DEMO = [
   { label: "Student", email: "student@labvault.io" },
 ];
 
+type ForgotResponse = { message?: string; demoResetToken?: string; expiresAt?: string; note?: string };
+
 export default function LoginPage() {
   const [email, setEmail] = useState("admin@labvault.io");
   const [password, setPassword] = useState("Password@123");
   const [error, setError] = useState<string | null>(null);
   const [bounced, setBounced] = useState(false);
   const [loading, setLoading] = useState(false);
+
+  // Forgot password dialog state
+  const [forgotOpen, setForgotOpen] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotError, setForgotError] = useState<string | null>(null);
+  const [forgotSent, setForgotSent] = useState(false);
+  const [demoToken, setDemoToken] = useState<string | null>(null);
+  const [resetMode, setResetMode] = useState(false);
+  const [resetToken, setResetToken] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
 
   // If we were sent back here right after a successful login, the browser is
   // dropping the session cookie (typically third-party cookie blocking inside
@@ -34,6 +58,82 @@ export default function LoginPage() {
       setBounced(true);
     }
   }, []);
+
+  function closeForgot() {
+    setForgotOpen(false);
+    // Reset the sub-flow after the dialog closes
+    setTimeout(() => {
+      setForgotEmail("");
+      setForgotSent(false);
+      setDemoToken(null);
+      setResetMode(false);
+      setResetToken("");
+      setNewPassword("");
+      setForgotError(null);
+      setResetError(null);
+    }, 200);
+  }
+
+  async function submitForgot(e: React.FormEvent) {
+    e.preventDefault();
+    setForgotError(null);
+    setForgotLoading(true);
+    try {
+      const res = await fetch("/api/auth/forgot-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: forgotEmail }),
+      });
+      const data = (await res.json().catch(() => ({}))) as ForgotResponse;
+      if (res.status !== 202 && !res.ok) {
+        throw new Error(
+          typeof data === "object" && data && "error" in data && typeof (data as { error?: { message?: string } }).error?.message === "string"
+            ? (data as { error: { message: string } }).error.message
+            : "Request failed"
+        );
+      }
+      setForgotSent(true);
+      if (data.demoResetToken) {
+        setDemoToken(data.demoResetToken);
+      }
+    } catch (err) {
+      setForgotError(err instanceof Error ? err.message : "Request failed");
+    } finally {
+      setForgotLoading(false);
+    }
+  }
+
+  function useTokenNow() {
+    if (demoToken) setResetToken(demoToken);
+    setResetMode(true);
+  }
+
+  async function submitReset(e: React.FormEvent) {
+    e.preventDefault();
+    setResetError(null);
+    setResetLoading(true);
+    try {
+      const res = await fetch("/api/auth/reset-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: resetToken.trim(), password: newPassword }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          typeof data?.error === "string"
+            ? data.error
+            : data?.error?.message || "Password reset failed";
+        throw new Error(msg);
+      }
+      toast({ title: "Password updated", description: "Sign in with your new password." });
+      closeForgot();
+    } catch (err) {
+      setResetError(err instanceof Error ? err.message : "Password reset failed");
+    } finally {
+      setResetLoading(false);
+    }
+  }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -97,6 +197,18 @@ export default function LoginPage() {
                 required
                 autoComplete="current-password"
               />
+              <div className="text-right">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForgotEmail(email);
+                    setForgotOpen(true);
+                  }}
+                  className="text-xs font-medium text-primary hover:underline"
+                >
+                  Forgot password?
+                </button>
+              </div>
             </div>
             {bounced ? (
               <Alert className="border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
@@ -152,6 +264,134 @@ export default function LoginPage() {
           </p>
         </CardContent>
       </Card>
+
+      {/* Forgot / reset password dialog */}
+      <Dialog open={forgotOpen} onOpenChange={(o) => (o ? setForgotOpen(true) : closeForgot())}>
+        <DialogContent className="sm:max-w-md">
+          {!resetMode ? (
+            <>
+              <DialogHeader>
+                <DialogTitle>Reset your password</DialogTitle>
+                <DialogDescription>
+                  Enter your account email and we will send a reset link.
+                </DialogDescription>
+              </DialogHeader>
+              {forgotSent ? (
+                <div className="space-y-3 py-1">
+                  <Alert>
+                    <AlertDescription>
+                      If the account exists, a reset link has been sent.
+                    </AlertDescription>
+                  </Alert>
+                  {demoToken ? (
+                    <Alert className="border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+                      <ShieldAlert className="h-4 w-4" aria-hidden="true" />
+                      <AlertDescription className="space-y-2 text-xs leading-relaxed">
+                        <p className="font-semibold">DEMO MODE — no email provider configured.</p>
+                        <p>
+                          Reset token:{" "}
+                          <span className="break-all font-mono">{demoToken}</span>
+                        </p>
+                        <Button type="button" size="sm" variant="outline" onClick={useTokenNow}>
+                          Use token now
+                        </Button>
+                      </AlertDescription>
+                    </Alert>
+                  ) : null}
+                </div>
+              ) : (
+                <form onSubmit={submitForgot} className="space-y-4 py-1">
+                  <div className="space-y-2">
+                    <Label htmlFor="forgot-email">Email</Label>
+                    <Input
+                      id="forgot-email"
+                      type="email"
+                      required
+                      autoComplete="email"
+                      value={forgotEmail}
+                      onChange={(e) => setForgotEmail(e.target.value)}
+                      placeholder="you@institute.edu"
+                    />
+                  </div>
+                  {forgotError ? (
+                    <Alert variant="destructive">
+                      <AlertDescription>{forgotError}</AlertDescription>
+                    </Alert>
+                  ) : null}
+                  <DialogFooter>
+                    <Button type="button" variant="outline" onClick={closeForgot} disabled={forgotLoading}>
+                      Cancel
+                    </Button>
+                    <Button type="submit" disabled={forgotLoading}>
+                      {forgotLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : null}
+                      Send reset link
+                    </Button>
+                  </DialogFooter>
+                </form>
+              )}
+            </>
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle>Choose a new password</DialogTitle>
+                <DialogDescription>Paste the reset token and set a new password.</DialogDescription>
+              </DialogHeader>
+              <form onSubmit={submitReset} className="space-y-4 py-1">
+                <div className="space-y-2">
+                  <Label htmlFor="reset-token">Reset token</Label>
+                  <Input
+                    id="reset-token"
+                    required
+                    value={resetToken}
+                    onChange={(e) => setResetToken(e.target.value)}
+                    placeholder="Paste the token from the reset link"
+                    className="font-mono text-xs"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="reset-password">New password</Label>
+                  <Input
+                    id="reset-password"
+                    type="password"
+                    required
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="At least 8 characters"
+                  />
+                </div>
+                {resetError ? (
+                  <Alert variant="destructive">
+                    <AlertDescription>{resetError}</AlertDescription>
+                  </Alert>
+                ) : null}
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setResetMode(false)}
+                    disabled={resetLoading}
+                  >
+                    Back
+                  </Button>
+                  <Button type="submit" disabled={resetLoading}>
+                    {resetLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : null}
+                    Reset password
+                  </Button>
+                </DialogFooter>
+              </form>
+            </>
+          )}
+          {forgotSent && !resetMode ? (
+            <DialogFooter>
+              <Button variant="outline" onClick={closeForgot}>
+                Done
+              </Button>
+            </DialogFooter>
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

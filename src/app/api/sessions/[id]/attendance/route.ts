@@ -1,41 +1,44 @@
 import { NextRequest } from "next/server";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody } from "@/lib/validation";
+import { NotFoundError } from "@/lib/errors";
+import { ATTENDANCE_STATUS } from "@/lib/constants";
 
-interface AttendanceRecord {
-  studentName?: string;
-  userId?: string;
-  status?: string;
-}
+const attendanceSchema = z.object({
+  records: z
+    .array(
+      z.object({
+        studentName: z.string().trim().min(1, "Each record requires a studentName").max(120),
+        userId: z.string().max(64).nullish(),
+        status: z.enum(ATTENDANCE_STATUS).optional().default("PRESENT"),
+      })
+    )
+    .min(1, "records array is required"),
+});
 
+// Replace-all semantics: an update wipes and re-creates the session's attendance.
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{ records?: AttendanceRecord[] }>(req);
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, attendanceSchema);
 
-    if (!Array.isArray(b.records) || b.records.length === 0) {
-      return fail("records array is required", 400);
-    }
-    for (const r of b.records) {
-      if (!r?.studentName?.trim()) return fail("Each record requires a studentName", 400);
-      if (r.status && !["PRESENT", "ABSENT", "LATE"].includes(r.status)) {
-        return fail("Invalid attendance status — must be PRESENT, ABSENT or LATE", 400);
-      }
-    }
-
-    const labSession = await db.labSession.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!labSession) return fail("Session not found", 404);
+    const labSession = await db.labSession.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
+      select: { id: true, title: true },
+    });
+    if (!labSession) throw NotFoundError("Session not found");
 
     const count = await db.$transaction(async (tx) => {
-      // Replace-all semantics: clear existing attendance, then insert new records
       await tx.attendance.deleteMany({ where: { sessionId: id } });
       const res = await tx.attendance.createMany({
-        data: b.records!.map((r) => ({
-          organizationId: session.orgId,
+        data: data.records.map((r) => ({
+          organizationId: ctx.session.orgId,
           sessionId: id,
-          studentName: r.studentName!.trim(),
+          studentName: r.studentName,
           userId: r.userId ?? null,
-          status: r.status ?? "PRESENT",
+          status: r.status,
         })),
       });
       return res.count;
@@ -46,10 +49,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       orderBy: { markedAt: "asc" },
     });
 
-    await audit(session.orgId, session.userId, "ATTENDANCE_MARKED", "LabSession", id, {
+    await audit(ctx.session.orgId, ctx.session.userId, "ATTENDANCE_MARKED", "LabSession", id, {
       count,
       session: labSession.title,
     });
     return ok({ success: true, count, attendance }, 201);
-  }, ["ADMIN", "LAB_MANAGER", "INSTRUCTOR"]);
+  }, "academics.manage");
 }

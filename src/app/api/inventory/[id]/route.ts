@@ -1,81 +1,86 @@
 import { NextRequest } from "next/server";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { NotFoundError, ConflictError, ValidationError } from "@/lib/errors";
+import { parseBody, mapPrismaError } from "@/lib/validation";
+
+const updateSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  sku: z.string().trim().min(1).max(60).optional(),
+  labId: z.string().min(1).optional(),
+  category: z.enum(["CONSUMABLE", "SPARE", "STATIONERY", "SAFETY"]).optional(),
+  unit: z.string().trim().max(30).optional(),
+  minQuantity: z.coerce.number().int().min(0).optional(),
+  location: z.string().trim().max(200).optional().nullable(),
+});
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{
-      name?: string;
-      sku?: string;
-      labId?: string;
-      category?: string;
-      quantity?: number | string;
-      unit?: string;
-      minQuantity?: number | string;
-      location?: string | null;
-    }>(req);
-
-    const item = await db.inventoryItem.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!item) return fail("Inventory item not found", 404);
-
-    if (b.labId) {
-      const lab = await db.lab.findFirst({ where: { id: b.labId, organizationId: session.orgId } });
-      if (!lab) return fail("Lab not found in your organization", 404);
+  return withAuth(req, async (ctx) => {
+    // Stock levels are LEDGER-ONLY — reject direct quantity edits.
+    const raw = (await req.clone().json().catch(() => ({}))) as Record<string, unknown>;
+    if ("quantity" in raw) {
+      throw ValidationError("Stock changes must go through inventory transactions");
     }
 
-    const data: Prisma.InventoryItemUncheckedUpdateInput = {};
-    if (b.name !== undefined) data.name = b.name.trim();
-    if (b.sku !== undefined) data.sku = b.sku.trim();
-    if (b.labId !== undefined) data.labId = b.labId;
-    if (b.category !== undefined) data.category = b.category;
-    if (b.quantity !== undefined) {
-      const quantity = Number(b.quantity);
-      if (Number.isNaN(quantity) || quantity < 0) return fail("Quantity must be a non-negative number");
-      data.quantity = Math.trunc(quantity);
+    const data = await parseBody(req, updateSchema);
+
+    const item = await db.inventoryItem.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
+    });
+    if (!item) throw NotFoundError("Inventory item not found");
+
+    if (data.labId && data.labId !== item.labId) {
+      const lab = await db.lab.findFirst({
+        where: { id: data.labId, organizationId: ctx.session.orgId },
+      });
+      if (!lab) throw NotFoundError("Lab not found in your organization");
     }
-    if (b.unit !== undefined) data.unit = b.unit;
-    if (b.minQuantity !== undefined) {
-      const minQuantity = Number(b.minQuantity);
-      if (Number.isNaN(minQuantity) || minQuantity < 0) {
-        return fail("minQuantity must be a non-negative number");
-      }
-      data.minQuantity = Math.trunc(minQuantity);
-    }
-    if (b.location !== undefined) data.location = b.location;
 
     try {
       const updated = await db.inventoryItem.update({
         where: { id },
-        data,
+        data: {
+          ...(data.name !== undefined ? { name: data.name } : {}),
+          ...(data.sku !== undefined ? { sku: data.sku } : {}),
+          ...(data.labId !== undefined ? { labId: data.labId } : {}),
+          ...(data.category !== undefined ? { category: data.category } : {}),
+          ...(data.unit !== undefined ? { unit: data.unit } : {}),
+          ...(data.minQuantity !== undefined ? { minQuantity: data.minQuantity } : {}),
+          ...(data.location !== undefined ? { location: data.location } : {}),
+        },
         include: { lab: { select: { id: true, name: true, code: true } } },
       });
-      await audit(session.orgId, session.userId, "INVENTORY_UPDATED", "InventoryItem", id, {
+      await audit(ctx.session.orgId, ctx.session.userId, "INVENTORY_UPDATED", "InventoryItem", id, {
         name: updated.name,
-        quantity: updated.quantity,
+        sku: updated.sku,
       });
       return ok(updated);
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        return fail("An inventory item with this SKU already exists in your organization", 409);
-      }
-      throw e;
+      mapPrismaError(e, "An inventory item with this SKU already exists in your organization");
     }
-  });
+  }, "inventory.adjust");
 }
 
 export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const item = await db.inventoryItem.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!item) return fail("Inventory item not found", 404);
+  return withAuth(_req, async (ctx) => {
+    const item = await db.inventoryItem.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
+      include: { _count: { select: { transactions: true } } },
+    });
+    if (!item) throw NotFoundError("Inventory item not found");
+
+    if (item._count.transactions > 0) {
+      throw ConflictError("Item has ledger history; retire via stock write-off instead");
+    }
 
     await db.inventoryItem.delete({ where: { id } });
-    await audit(session.orgId, session.userId, "INVENTORY_DELETED", "InventoryItem", id, {
+    await audit(ctx.session.orgId, ctx.session.userId, "INVENTORY_DELETED", "InventoryItem", id, {
       name: item.name,
       sku: item.sku,
     });
     return ok({ success: true });
-  });
+  }, "labs.manage");
 }

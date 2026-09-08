@@ -1,71 +1,110 @@
 import { NextRequest } from "next/server";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
 import { db } from "@/lib/db";
-import { ok, fail, body, withAuth, audit } from "@/lib/api";
+import { ok, withAuth, audit } from "@/lib/api";
+import { parseBody, optionalId } from "@/lib/validation";
+import { SESSION_STATUS } from "@/lib/constants";
+import { can } from "@/lib/permissions";
+import { NotFoundError, ConflictError, ForbiddenError } from "@/lib/errors";
 
-const SESSION_STATUSES = ["SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED"];
+// SCHEDULED → IN_PROGRESS → COMPLETED, either of the first two → CANCELLED
+const SESSION_TRANSITIONS: Record<string, string[]> = {
+  SCHEDULED: ["IN_PROGRESS", "CANCELLED"],
+  IN_PROGRESS: ["COMPLETED", "CANCELLED"],
+  COMPLETED: [],
+  CANCELLED: [],
+};
 
-export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+const updateSessionSchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  scheduledAt: z
+    .string()
+    .refine((v) => !Number.isNaN(new Date(v).getTime()), "Invalid scheduledAt date")
+    .optional(),
+  durationMin: z.coerce.number().int().positive("durationMin must be a positive number").optional(),
+  room: z.string().trim().max(120).nullish(),
+  status: z.enum(SESSION_STATUS).optional(),
+  remarks: z.string().max(1000).nullish(),
+  labId: optionalId,
+  instructorId: optionalId,
+});
+
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return withAuth(async (session) => {
-    const b = await body<{
-      title?: string;
-      scheduledAt?: string;
-      durationMin?: number | string;
-      room?: string | null;
-      status?: string;
-      labId?: string | null;
-      instructorId?: string | null;
-    }>(req);
-
-    if (b.status && !SESSION_STATUSES.includes(b.status)) {
-      return fail(`Invalid status — must be one of: ${SESSION_STATUSES.join(", ")}`);
-    }
-
-    const labSession = await db.labSession.findFirst({ where: { id, organizationId: session.orgId } });
-    if (!labSession) return fail("Session not found", 404);
-
-    if (b.labId) {
-      const lab = await db.lab.findFirst({ where: { id: b.labId, organizationId: session.orgId } });
-      if (!lab) return fail("Lab not found in your organization", 404);
-    }
-    if (b.instructorId) {
-      const instructor = await db.user.findFirst({
-        where: { id: b.instructorId, organizationId: session.orgId },
-      });
-      if (!instructor) return fail("Instructor not found in your organization", 404);
-    }
-
-    const data: Prisma.LabSessionUncheckedUpdateInput = {};
-    if (b.title !== undefined) data.title = b.title.trim();
-    if (b.scheduledAt !== undefined) {
-      const scheduledAt = new Date(b.scheduledAt);
-      if (Number.isNaN(scheduledAt.getTime())) return fail("Invalid scheduledAt date", 400);
-      data.scheduledAt = scheduledAt;
-    }
-    if (b.durationMin !== undefined) {
-      const durationMin = Number(b.durationMin);
-      if (Number.isNaN(durationMin) || durationMin <= 0) {
-        return fail("durationMin must be a positive number");
-      }
-      data.durationMin = Math.trunc(durationMin);
-    }
-    if (b.room !== undefined) data.room = b.room;
-    if (b.status !== undefined) data.status = b.status;
-    if (b.labId !== undefined) data.labId = b.labId;
-    if (b.instructorId !== undefined) data.instructorId = b.instructorId;
-
-    const updated = await db.labSession.update({
-      where: { id },
-      data,
+  return withAuth(req, async (ctx) => {
+    const labSession = await db.labSession.findFirst({
+      where: { id, organizationId: ctx.session.orgId },
       include: {
         experiment: { select: { id: true, title: true, code: true } },
         lab: { select: { id: true, name: true } },
-        instructor: { select: { id: true, name: true } },
+        instructor: { select: { id: true, name: true, email: true } },
         attendance: { orderBy: { markedAt: "asc" } },
+        grades: { orderBy: { createdAt: "asc" } },
       },
     });
-    await audit(session.orgId, session.userId, "SESSION_UPDATED", "LabSession", id, {
+    if (!labSession) throw NotFoundError("Session not found");
+    return ok(labSession);
+  }, "academics.read");
+}
+
+export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return withAuth(req, async (ctx) => {
+    const data = await parseBody(req, updateSessionSchema);
+
+    const labSession = await db.labSession.findFirst({ where: { id, organizationId: ctx.session.orgId } });
+    if (!labSession) throw NotFoundError("Session not found");
+
+    // academics.manage OR the session's own instructor
+    const isManager = can(ctx.session.role, "academics.manage");
+    const isInstructor = labSession.instructorId === ctx.session.userId;
+    if (!isManager && !isInstructor) {
+      throw ForbiddenError("Forbidden — requires academics.manage or session instructor");
+    }
+
+    if (data.labId) {
+      const lab = await db.lab.findFirst({
+        where: { id: data.labId, organizationId: ctx.session.orgId },
+        select: { id: true },
+      });
+      if (!lab) throw NotFoundError("Lab not found in your organization");
+    }
+    if (data.instructorId) {
+      const instructor = await db.user.findFirst({
+        where: { id: data.instructorId, organizationId: ctx.session.orgId },
+        select: { id: true },
+      });
+      if (!instructor) throw NotFoundError("Instructor not found in your organization");
+    }
+
+    if (data.status && data.status !== labSession.status) {
+      const allowed = SESSION_TRANSITIONS[labSession.status] ?? [];
+      if (!allowed.includes(data.status)) {
+        throw ConflictError(`Invalid session transition: ${labSession.status} → ${data.status}`);
+      }
+    }
+
+    const updated = await db.labSession.update({
+      where: { id },
+      data: {
+        ...(data.title !== undefined ? { title: data.title } : {}),
+        ...(data.scheduledAt !== undefined ? { scheduledAt: new Date(data.scheduledAt) } : {}),
+        ...(data.durationMin !== undefined ? { durationMin: data.durationMin } : {}),
+        ...(data.room !== undefined ? { room: data.room ?? null } : {}),
+        ...(data.status !== undefined ? { status: data.status } : {}),
+        ...(data.remarks !== undefined ? { remarks: data.remarks ?? null } : {}),
+        ...(data.labId !== undefined ? { labId: data.labId ?? null } : {}),
+        ...(data.instructorId !== undefined ? { instructorId: data.instructorId ?? null } : {}),
+      },
+      include: {
+        experiment: { select: { id: true, title: true, code: true } },
+        lab: { select: { id: true, name: true } },
+        instructor: { select: { id: true, name: true, email: true } },
+        attendance: { orderBy: { markedAt: "asc" } },
+        grades: { orderBy: { createdAt: "asc" } },
+      },
+    });
+    await audit(ctx.session.orgId, ctx.session.userId, "SESSION_UPDATED", "LabSession", id, {
       title: updated.title,
       status: updated.status,
     });
